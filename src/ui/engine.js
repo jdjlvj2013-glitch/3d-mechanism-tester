@@ -67,7 +67,7 @@ export function normalizeAutoAssemble(res, parts = []) {
   const ids = new Set(parts.map(p => p.id));
   let list = Array.isArray(res) ? res : (res?.poses ?? res?.parts ?? res?.placements ?? []);
   if (list && !Array.isArray(list) && typeof list === 'object') list = Object.entries(list).map(([id, v]) => (v?.isMatrix4 || Array.isArray(v) ? { id, matrix: v } : { id, ...v }));
-  const poses = (list || []).map(p => ({ id: p?.id ?? p?.part, matrix: poseMatrix(p || {}), confidence: conf(p?.confidence ?? p?.score), reason: String(p?.note ?? p?.reason ?? p?.why ?? '') || 'no reason given' }))
+  const poses = (list || []).map(p => ({ id: p?.id ?? p?.part, matrix: poseMatrix(p || {}), role: p?.role ? String(p.role) : '', confidence: conf(p?.confidence ?? p?.score), reason: String(p?.note ?? p?.reason ?? p?.why ?? '') || 'no reason given' }))
     .filter(p => p.id != null && (!ids.size || ids.has(p.id)));
   const joints = (Array.isArray(res?.joints) ? res.joints : []).filter(j => j && j.part != null && (!ids.size || ids.has(j.part))).map((j, i) => {
     const type = ['slider', 'hinge', 'fixed'].includes(j.type) ? j.type : (/rot|rev|hinge/i.test(j.type) ? 'hinge' : /slid|pris|lin/i.test(j.type) ? 'slider' : 'fixed');

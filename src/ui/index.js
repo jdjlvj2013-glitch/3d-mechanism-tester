@@ -307,6 +307,10 @@ export function mount(root) {
     } finally { btn.disabled = false; S.autoBusy = false; }
     if (run !== autoRun) return;
     S.autoResult = { status: 'ok', ms: Math.round(performance.now() - t0), mode: res.mode };
+    { const seen = {}; const roleOf = new Map(res.poses.filter(p => p.role).map(p => [p.id, p.role]));
+      for (const pt of S.parts) { const r = roleOf.get(pt.id); if (!r || !/^Part \d+ \(|#\d+$|\.3mf$/i.test(pt.name)) continue;
+        const nm = r[0].toUpperCase() + r.slice(1); seen[nm] = (seen[nm] || 0) + 1; pt.name = seen[nm] > 1 ? `${nm} ${seen[nm]}` : nm; }
+      if (Object.keys(seen).length) renderAll(); }
     // engine gives each part a fixed joint with offset (= its pose, maybe relative to a parent); use it as the pose item
     const placeJ = new Map(res.joints.filter(j => j.type === 'fixed' && j.offset).map(j => [j.part, j]));
     const strip = (j) => (({ confidence, reason, ...r }) => ({ ...r, auto: true }))(j);
