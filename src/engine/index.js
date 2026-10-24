@@ -4,7 +4,7 @@ import * as THREE from 'three';
 import { checkPose, solveJoints } from './core.js';
 import { autoAssemble, abortErr as aaAbort } from './assemble.js';
 export * from './core.js';
-export { autoAssemble, ROTATIONS_24 } from './assemble.js';
+export { autoAssemble, isPlateLayout, ROTATIONS_24 } from './assemble.js';
 const toMat = (m) => (m instanceof THREE.Matrix4 ? m.clone() : m ? new THREE.Matrix4().fromArray(m) : new THREE.Matrix4());
 
 // ---------- async sweep (Web Worker in browser, chunked fallback elsewhere) ----------

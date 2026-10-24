@@ -288,9 +288,23 @@ function pinAxis(P) { // elongated, round-ish bbox -> pin along long axis (world
 }
 
 // ---------- main ----------
+// print-plate layout (e.g. a slicer 3MF): every part lies on z=0 in its given pose and the XY footprints are disjoint.
+// Such coordinates say nothing about the assembly, so pass 1 (keep in place) is skipped.
+export function isPlateLayout(parts, poses = {}) {
+  if (parts.length < 2) return false;
+  const bbs = parts.map((p) => { if (!p.geometry.boundingBox) p.geometry.computeBoundingBox(); const b = p.geometry.boundingBox.clone(); return poses?.[p.id] ? b.applyMatrix4(toMat(poses[p.id])) : b; });
+  if (!bbs.every((b) => Math.abs(b.min.z) < 0.5)) return false;
+  for (let i = 0; i < bbs.length; i++) for (let j = i + 1; j < bbs.length; j++) {
+    const a = bbs[i], b = bbs[j];
+    if (a.min.x < b.max.x - 0.01 && b.min.x < a.max.x - 0.01 && a.min.y < b.max.y - 0.01 && b.min.y < a.max.y - 0.01) return false;
+  }
+  return true;
+}
+
 /**
  * autoAssemble(parts, opts) -> Promise<{ poses, joints, guesses, mode, collisions, timeMs }>
  * parts: [{id, geometry}] ; opts: {poses?, base?, clearance=0.3, onProgress?(done,total,msg), signal?, trustInPlace=true}
+ * result.layout = 'plate' when the input is a print-plate layout (pass 1 skipped, everything searched)
  */
 export async function autoAssemble(parts, opts = {}) {
   const t0 = Date.now(), { signal, onProgress, clearance = 0.3 } = opts;
@@ -324,7 +338,9 @@ export async function autoAssemble(parts, opts = {}) {
     return { kept, rej };
   };
   let keep = { kept: [base], rej: {} }, frame = 'opts.poses';
-  if (opts.trustInPlace !== false && P.length > 1) {
+  const plate = isPlateLayout(parts, opts.poses);
+  if (plate) P.forEach((p) => { if (p !== base) why[p.id] = 'print-plate layout: position ignored'; });
+  if (opts.trustInPlace !== false && P.length > 1 && !plate) {
     const variants = [['opts.poses', Object.fromEntries(P.map((p) => [p.id, baseInv.clone().multiply(p.given)]))]];
     if (P.some((p) => !p.given.equals(new THREE.Matrix4()))) variants.push(['raw STL coordinates', Object.fromEntries(P.map((p) => [p.id, new THREE.Matrix4()]))]);
     let bestRel = null;
@@ -450,6 +466,6 @@ export async function autoAssemble(parts, opts = {}) {
     guesses.push({ part: p.id, matedTo: p.matedTo, poseConfidence: p.conf ?? 0, joint: j.parent ? 'fixed(parent ' + j.parent + ')' : j.type, jointConfidence: j.confidence, reason: reasons[p.id] + ' | ' + j.reason, note: j.note || note });
   }
   const cp = checkPose(P, W, { tolerance: 0 });
-  return { poses, joints, guesses, mode: inPlace ? 'in-place' : keep.kept.length > 1 ? 'mixed' : 'search', kept: keep.kept.map((p) => p.id), pass1: { frame, rejected: why }, base: base.id, collisions: cp.collisions.map(({ a, b }) => ({ a, b })), timeMs: Date.now() - t0 };
+  return { poses, joints, guesses, layout: plate ? 'plate' : 'assembly', mode: inPlace ? 'in-place' : keep.kept.length > 1 ? 'mixed' : 'search', kept: keep.kept.map((p) => p.id), pass1: { frame, rejected: why }, base: base.id, collisions: cp.collisions.map(({ a, b }) => ({ a, b })), timeMs: Date.now() - t0 };
 }
 
