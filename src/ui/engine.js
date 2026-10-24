@@ -65,12 +65,12 @@ export function normalizeAutoAssemble(res, parts = []) {
   const ids = new Set(parts.map(p => p.id));
   let list = Array.isArray(res) ? res : (res?.poses ?? res?.parts ?? res?.placements ?? []);
   if (list && !Array.isArray(list) && typeof list === 'object') list = Object.entries(list).map(([id, v]) => (v?.isMatrix4 || Array.isArray(v) ? { id, matrix: v } : { id, ...v }));
-  const poses = (list || []).map(p => ({ id: p?.id ?? p?.part, matrix: poseMatrix(p || {}), confidence: conf(p?.confidence ?? p?.score), reason: String(p?.reason ?? p?.why ?? '') || 'no reason given' }))
+  const poses = (list || []).map(p => ({ id: p?.id ?? p?.part, matrix: poseMatrix(p || {}), confidence: conf(p?.confidence ?? p?.score), reason: String(p?.note ?? p?.reason ?? p?.why ?? '') || 'no reason given' }))
     .filter(p => p.id != null && (!ids.size || ids.has(p.id)));
   const joints = (Array.isArray(res?.joints) ? res.joints : []).filter(j => j && j.part != null && (!ids.size || ids.has(j.part))).map((j, i) => {
     const type = ['slider', 'hinge', 'fixed'].includes(j.type) ? j.type : (/rot|rev|hinge/i.test(j.type) ? 'hinge' : /slid|pris|lin/i.test(j.type) ? 'slider' : 'fixed');
     const rg = Array.isArray(j.range) && j.range.length >= 2 ? [num(j.range[0], 0), num(j.range[1], 0)] : (type === 'hinge' ? [0, 90] : type === 'slider' ? [0, 50] : [0, 0]);
-    return { ...j, id: j.id || 'auto' + Date.now() + '_' + i, part: j.part, type, axis: vec3(j.axis, [1, 0, 0]), origin: vec3(j.origin, [0, 0, 0]), range: rg, confidence: conf(j.confidence ?? j.score), reason: String(j.reason ?? j.why ?? '') || 'no reason given' };
+    return { ...j, id: j.id || 'auto' + Date.now() + '_' + i, part: j.part, type, axis: vec3(j.axis, [1, 0, 0]), origin: vec3(j.origin, [0, 0, 0]), range: rg, confidence: conf(j.confidence ?? j.score), reason: String(j.note ?? j.reason ?? j.why ?? '') || 'no reason given' };
   });
   return { source: res?.source || engineInfo.autoAssemble, poses, joints };
 }
