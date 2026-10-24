@@ -52,6 +52,35 @@ if (existsSync(root + '/models/v1_housing.stl')) {
   const M = new THREE.Matrix4().fromArray(r.poses.find((q) => q.id === 'v1_backplate').matrix);
   assert.ok(Math.abs(new THREE.Vector3().setFromMatrixPosition(M).y - 94.61) < 1.5, 'v1 backplate placed on the housing');
 }
+// v4 cup holder: four-bar keeps the ring level, deployed hard stop engages, a Ø90 mug fits and lifts out (0.3 mm tol)
+{
+  const v4 = presets.find((p) => p.id === 'v4');
+  if (v4 && existsSync(root + '/models/v4_cup_ring.stl')) {
+    const parts = await Promise.all(v4.parts.map(async (p) => ({ id: p.id, geometry: await loadSTL(root + '/models/' + p.file) })));
+    const R0 = solveJoints(v4.joints, 0).cup_ring, R1 = solveJoints(v4.joints, 1).cup_ring;
+    for (let t = 0; t <= 1; t += 0.125) { // pure translation: rotation part equals the folded one
+      const R = solveJoints(v4.joints, t).cup_ring.elements, A = R0.elements;
+      [0, 1, 2, 4, 5, 6, 8, 9, 10].forEach((i) => assert.ok(Math.abs(R[i] - A[i]) < 1e-9, 'ring level at t=' + t));
+    }
+    const d = new THREE.Vector3().setFromMatrixPosition(R1).sub(new THREE.Vector3().setFromMatrixPosition(R0));
+    assert.ok(Math.abs(d.y + 110) < 1e-6 && Math.abs(d.z + 110) < 1e-6, 'ring drops/moves 110 mm (link length)');
+    const end = classify(checkPose(parts, solveJoints(v4.joints, 1), { tolerance: 0.3 }), v4.expected);
+    assert.ok(['L', 'R'].every((s) => [...end.collisions, ...end.nearMisses].some((h) => h.a === 'mount' && h.b === 'link_a_' + s && h.expected)), 'deployed hard stop touches link_a both sides');
+    assert.equal([...end.collisions, ...end.nearMisses].filter((h) => !h.expected).length, 0);
+    // mug Ø90 x 95 standing on the perforated floor (3 mm), and lifted 35 mm to clear the 30 mm ring wall
+    const mugG = new THREE.CylinderGeometry(45, 45, 95, 96).rotateX(Math.PI / 2).translate(0, 0, 3 + 47.5 + 0.05);
+    for (const lift of [0, 35]) {
+      const mug = R1.clone().premultiply(new THREE.Matrix4().makeTranslation(0, 0, lift));
+      const r = checkPose([...parts, { id: 'mug', geometry: mugG }], { ...solveJoints(v4.joints, 1), mug }, { tolerance: 0.3 });
+      assert.equal(r.collisions.filter((c) => c.b === 'mug' || c.a === 'mug').length, 0, 'mug clear, lift ' + lift);
+      mugG.computeBoundingBox(); assert.ok(mugG.boundingBox.clone().applyMatrix4(mug).max.z < 0, 'mug stays below the desk (z=0) while lifting out');
+    }
+    // folded: everything stays under the desk plane z=0
+    const F = solveJoints(v4.joints, 0);
+    for (const p of parts) { p.geometry.computeBoundingBox(); assert.ok(p.geometry.boundingBox.clone().applyMatrix4(F[p.id] || new THREE.Matrix4()).max.z <= 1e-6, p.id + ' under desk'); }
+    console.log('v4 checks OK (ring level, stop engages, mug fits + lifts out, folded under desk)');
+  }
+}
 console.log('unit checks OK');
 
 const inBox = (pt, [mn, mx]) => pt.every((v, i) => v >= mn[i] && v <= mx[i]);
