@@ -1,0 +1,43 @@
+{
+  "name": "Test: drawer too wide (interference)",
+  "description": "Should be RED: drawer overlaps the slot walls.",
+  "settings": {
+    "tolerance": 0.3
+  },
+  "parts": [
+    {
+      "id": "slot",
+      "name": "Slot (fixed)",
+      "file": "slot.stl",
+      "fixed": true,
+      "color": "#8fb3ff"
+    },
+    {
+      "id": "drawer",
+      "name": "Drawer",
+      "file": "drawer_tight_interference.stl",
+      "color": "#ffb36b"
+    }
+  ],
+  "joints": [
+    {
+      "id": "pull",
+      "part": "drawer",
+      "type": "slider",
+      "axis": [
+        0,
+        -1,
+        0
+      ],
+      "origin": [
+        0,
+        0,
+        0
+      ],
+      "range": [
+        0,
+        60
+      ]
+    }
+  ]
+}

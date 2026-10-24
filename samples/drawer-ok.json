@@ -1,0 +1,43 @@
+{
+  "name": "Test: drawer with 0.2 mm clearance",
+  "description": "Should be YELLOW (0.2 mm < 0.3 mm tolerance), no red crash.",
+  "settings": {
+    "tolerance": 0.3
+  },
+  "parts": [
+    {
+      "id": "slot",
+      "name": "Slot (fixed)",
+      "file": "slot.stl",
+      "fixed": true,
+      "color": "#8fb3ff"
+    },
+    {
+      "id": "drawer",
+      "name": "Drawer",
+      "file": "drawer_ok_0.2mm.stl",
+      "color": "#ffb36b"
+    }
+  ],
+  "joints": [
+    {
+      "id": "pull",
+      "part": "drawer",
+      "type": "slider",
+      "axis": [
+        0,
+        -1,
+        0
+      ],
+      "origin": [
+        0,
+        0,
+        0
+      ],
+      "range": [
+        0,
+        60
+      ]
+    }
+  ]
+}

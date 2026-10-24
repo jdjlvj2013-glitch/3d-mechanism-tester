@@ -1,0 +1,86 @@
+solid drawer_ok_0.2mm.stl
+ facet normal 0 0 0
+  outer loop
+   vertex -24.8 0 0.2
+   vertex -24.8 79.6 0.2
+   vertex 24.8 79.6 0.2
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex -24.8 0 0.2
+   vertex 24.8 79.6 0.2
+   vertex 24.8 0 0.2
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex -24.8 0 29.8
+   vertex 24.8 0 29.8
+   vertex 24.8 79.6 29.8
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex -24.8 0 29.8
+   vertex 24.8 79.6 29.8
+   vertex -24.8 79.6 29.8
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex -24.8 0 0.2
+   vertex 24.8 0 0.2
+   vertex 24.8 0 29.8
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex -24.8 0 0.2
+   vertex 24.8 0 29.8
+   vertex -24.8 0 29.8
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex -24.8 79.6 0.2
+   vertex -24.8 79.6 29.8
+   vertex 24.8 79.6 29.8
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex -24.8 79.6 0.2
+   vertex 24.8 79.6 29.8
+   vertex 24.8 79.6 0.2
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex -24.8 0 0.2
+   vertex -24.8 0 29.8
+   vertex -24.8 79.6 29.8
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex -24.8 0 0.2
+   vertex -24.8 79.6 29.8
+   vertex -24.8 79.6 0.2
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex 24.8 0 0.2
+   vertex 24.8 79.6 0.2
+   vertex 24.8 79.6 29.8
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex 24.8 0 0.2
+   vertex 24.8 79.6 29.8
+   vertex 24.8 0 29.8
+  endloop
+ endfacet
+endsolid drawer_ok_0.2mm.stl
