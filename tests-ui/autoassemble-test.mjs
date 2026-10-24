@@ -191,5 +191,76 @@ for (const view of Object.keys(VIEWS)) {
   check(`${key}: cycles 0/90/180/270, Z button, saved + loaded with project`, cyc.rx.join() === '2,3,0,1' && cyc.rz === 1 && saved?.rx === 1 && cyc.afterLoad.rx === 1 && cyc.afterLoad.rz === 0, { cyc, saved });
   await p.close();
 }
+
+// ---------- Part E: v4 four-bar cup holder: sample folds; two hinges per carried part survive normalize/panel/Accept all; ring level; names; Undo all ----------
+{
+  const V4 = ['v4_mount.stl', 'v4_link_a.stl', 'v4_link_b.stl', 'v4_cup_ring.stl', 'v4_pin.stl'];
+  const V4CASES = { 'v4 STLs': V4.map(f => 'public/models/' + f) };
+  for (const f of ['/workspace/cup_holder/print_layout.3mf', 'tests-ui/fixtures/v4_unnamed.3mf']) if (fsx.existsSync(f)) V4CASES[f.includes('unnamed') ? 'v4 unnamed 3MF' : 'v4 3MF'] = [f]; // /workspace/cup_holder copy == public/models/v4_print_layout.3mf
+  for (const view of Object.keys(VIEWS)) {
+    // (1) sample
+    { const p = await open(view);
+      const r = await p.evaluate(async () => { const a = window.__mechTester, S = a.state; const L = a.listPresets(), all = [...(L.gram || []), ...(L.samples || [])]; const pr = all.find(x => /v4|cup/i.test(x.id + ' ' + x.name));
+        if (!pr) return { err: 'no v4 preset', list: all.map(x => x.name) };
+        const card = [...document.querySelectorAll('[data-s=presets] .card')].find(c => c.querySelector('b')?.textContent === pr.name);
+        if (card) card.click(); else await a.openPreset(pr);
+        for (let i = 0; i < 100 && (S.parts.length < pr.parts.length || !S.joints.length); i++) await new Promise(r => setTimeout(r, 100)); await new Promise(r => setTimeout(r, 300));
+        const slider = document.querySelector('[data-s=slider]'), slide = (v) => { slider.value = v; slider.dispatchEvent(new Event('input', { bubbles: true })); };
+        slide(0); const p0 = a.poses(); slide(1000); const p1 = a.poses();
+        const moved = Object.keys(p0).filter(k => p0[k].some((v, i) => Math.abs(v - p1[k][i]) > 1e-3));
+        return { id: pr.id, viaCard: !!card, parts: S.parts.length, want: pr.parts.length, moved: moved.map(k => S.parts.find(x => x.id === k)?.name), label: document.querySelector('[data-s=tval]').textContent }; });
+      await p.screenshot({ path: `screenshots/v4-sample-${view}-t1.png` });
+      check(`${view} v4: (1) sample loads and folds with slider`, !r.err && r.parts === r.want && r.moved.length === 9 && r.moved.includes("cup_ring"), r); await p.close(); }
+    for (const [name, files] of Object.entries(V4CASES)) {
+      const p = await open(view);
+      const bufs = files.map(f => [f.split('/').pop(), fsx.readFileSync(f).toString('base64')]);
+      const r = await p.evaluate(async (bufs) => { const a = window.__mechTester, S = a.state;
+        for (const [n, b64] of bufs) await a.addBuffer(n, Uint8Array.from(atob(b64), c => c.charCodeAt(0)).buffer);
+        const before = JSON.stringify({ names: S.parts.map(x => x.name), fixed: S.parts.map(x => x.fixed), joints: S.joints, poses: a.poses(), exp: S.expected });
+        const names0 = S.parts.map(x => x.name);
+        await a.runAuto(); if (!S.auto) return { err: document.querySelector('[data-s=auto]').innerText };
+        const res = S.lastAuto, roles = Object.fromEntries(res.poses.map(x => [x.id, x.role]));
+        const hingeCount = (list) => { const m = {}; list.filter(j => j.type === 'hinge').forEach(j => m[j.part] = (m[j.part] || 0) + 1); return m; };
+        const normH = hingeCount(res.joints), panelH = hingeCount(S.auto.items.filter(i => i.kind === 'joint').map(i => i.joint));
+        const panelRows = document.querySelectorAll('[data-s=auto] .auto-item').length, items = S.auto.items.length;
+        const names = S.parts.map(x => x.name);
+        // Undo all
+        const undoState = () => JSON.stringify({ names: S.parts.map(x => x.name), fixed: S.parts.map(x => x.fixed), joints: S.joints, poses: a.poses(), exp: S.expected });
+        document.querySelector('[data-k=undoall]').click(); const afterUndo = undoState();
+        await a.runAuto();
+        [...document.querySelectorAll('[data-s=auto] button')].find(x => x.textContent === 'Accept all').click();
+        const accH = hingeCount(S.joints);
+        const cards = [...document.querySelectorAll('[data-s=joints] .card')].map(c => ({ part: c.querySelector('[data-k=part]')?.value, type: c.querySelector('[data-k=type]')?.value }));
+        const cardH = {}; cards.filter(c => c.type === 'hinge').forEach(c => cardH[c.part] = (cardH[c.part] || 0) + 1);
+        const M = (arr) => new (S.parts[0].mesh.matrix.constructor)().fromArray(arr);
+        const slider = document.querySelector('[data-s=slider]'), slide = (v) => { slider.value = v; slider.dispatchEvent(new Event('input', { bubbles: true })); };
+        slide(0); const p0 = a.poses(); slide(500); const pm = a.poses(); slide(1000); const p1 = a.poses();
+        const ring = Object.keys(roles).find(k => roles[k] === 'carrier'); let ringR = null;
+        if (ring) { const pt = S.parts.find(x => x.id === ring); pt.geometry.computeBoundingBox(); const c = pt.geometry.boundingBox.getCenter(new (pt.mesh.position.constructor)());
+          const rot = (A, B) => { const e = M(A).invert().multiply(M(B)).elements; const R = [e[0], e[1], e[2], e[4], e[5], e[6], e[8], e[9], e[10]]; return +(Math.acos(Math.min(1, Math.max(-1, (R[0] + R[4] + R[8] - 1) / 2))) * 180 / Math.PI).toFixed(2); };
+          const c0 = c.clone().applyMatrix4(M(p0[ring])), c1 = c.clone().applyMatrix4(M(p1[ring]));
+          ringR = { rot01: rot(p0[ring], p1[ring]), rotMid: rot(p0[ring], pm[ring]), d: [c1.x - c0.x, c1.y - c0.y, c1.z - c0.z].map(v => +v.toFixed(1)), dist: +c0.distanceTo(c1).toFixed(1) }; }
+        return { names0, names, roles: S.parts.map(x => roles[x.id]), normH, panelH, accH, cardH, panelRows, items, raw: res.joints.length,
+          accepted: S.joints.length, cardsN: cards.length, ringR, undoOk: afterUndo === before, undoDiff: afterUndo === before ? null : [before.slice(0, 200), afterUndo.slice(0, 200)], ms: S.autoResult.ms }; }, bufs);
+      const key = `${view} ${name}`;
+      if (r.err) { check(`${key}: auto-assemble ran`, false, r); await p.close(); continue; }
+      await p.evaluate(() => document.querySelector('[data-s=joints]').scrollIntoView()); await p.screenshot({ path: `screenshots/v4-${name.replace(/\W+/g, '_')}-${view}-t1.png` });
+      console.log('INFO', key, JSON.stringify({ ms: r.ms, normH: r.normH }));
+      const two = Object.entries(r.normH).filter(([, n]) => n >= 2).map(([k]) => k);
+      const eq = (x, y) => JSON.stringify(Object.entries(x).sort()) === JSON.stringify(Object.entries(y).sort());
+      check(`${key}: (2) two hinges per carrier/coupler pin kept through normalize, panel, Accept all, editor`, two.length >= (name === 'v4 STLs' ? 1 : 5) && eq(r.normH, r.panelH) && eq(r.normH, r.accH) && eq(r.normH, r.cardH) && r.cardsN === r.accepted && r.panelRows === r.items,
+        { normalize: r.normH, panel: r.panelH, accepted: r.accH, editor: r.cardH, rows: [r.panelRows, r.items], cards: [r.cardsN, r.accepted] });
+      const g = r.ringR;
+      check(`${key}: (2) ring stays level, moves ~110 mm down+forward`, !!g && g.rot01 < 0.5 && g.rotMid < 0.5 && Math.abs(g.d[2] + 110) < 10 && Math.abs(g.d[1] + 110) < 10, g || {});
+      const unnamed = r.names0.some(n => /^Part \d+ \(|#\d+$|\.3mf$/i.test(n));
+      const ok3 = r.names.every((n, i) => { const ro = r.roles[i]; if (!ro || ro === 'part') return true; const nm = ro === 'base' ? '(Base|Mount)' : ro[0].toUpperCase() + ro.slice(1); return new RegExp(`^${nm}( \\d+)?$`).test(n); })
+        && r.names.includes('Link') && r.names.includes('Link 2') && r.names.includes('Carrier') && r.names.includes('Pin');
+      check(`${key}: (3) renamed Link, Link 2, Carrier, Pin…`, unnamed ? ok3 : r.names.join() === r.names0.join(), { before: r.names0, after: r.names, roles: r.roles, mode: unnamed ? 'unnamed→renamed' : 'named→kept' });
+      check(`${key}: (4) Undo all restores everything`, r.undoOk, r.undoDiff || {});
+      await p.close();
+    }
+  }
+}
+
 check('no console / page errors', errors.length === 0, { errors });
 console.log(allOk ? 'PASS' : 'FAIL'); await b.close(); process.exit(allOk ? 0 : 1);
