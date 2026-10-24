@@ -1,6 +1,6 @@
 // Module worker: runs sweep off the main thread. Message in: {parts:[{id, position:Float32Array}], joints, opts}.
 import * as THREE from 'three';
-import { checkPose, solveJoints } from './index.js';
+import { checkPose, solveJoints } from './core.js';
 self.onmessage = ({ data }) => {
   try {
     const parts = data.parts.map((p) => {

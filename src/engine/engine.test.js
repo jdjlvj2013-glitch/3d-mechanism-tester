@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { checkPose, solveJoints, sweep, sweepAsync, loadSTL, classify, THREE } from './index.js';
+import { checkPose, solveJoints, sweep, sweepAsync, loadSTL, classify, autoAssemble, THREE } from './index.js';
 import { presets } from './presets/index.js';
 const root = fileURLToPath(new URL('../../public', import.meta.url));
 
@@ -26,6 +26,21 @@ const p = new THREE.Vector3(2, 0, 0).applyMatrix4(h.a); assert.ok(p.distanceTo(n
   assert.equal(seen, 2);
   const pre = new AbortController(); pre.abort();
   await assert.rejects(sweepAsync(P, J, { signal: pre.signal }), (e) => e.name === 'AbortError');
+}
+// autoAssemble smoke (contract only; accuracy is reported by assemble.test.js)
+{
+  const v1p = presets.find((p) => p.id === 'v1'), T = solveJoints(v1p.joints, 0);
+  const parts = await Promise.all(v1p.parts.map(async (p) => ({ id: p.id, geometry: await loadSTL(root + '/models/' + p.file) })));
+  let prog = 0; const r = await autoAssemble(parts, { poses: T, onProgress: () => prog++ });
+  assert.equal(r.mode, 'in-place'); assert.ok(prog > 0);
+  assert.equal(r.poses.length, 3); r.poses.forEach((p) => { assert.equal(p.matrix.length, 16); assert.ok(p.confidence >= 0 && p.confidence <= 1); assert.ok(p.note); });
+  const sl = r.joints.find((j) => j.part === 'drawer' && j.type === 'slider'); assert.ok(sl, 'drawer slider inferred');
+  assert.ok(Math.abs(sl.axis[1] + 1) < 1e-6 && sl.range[1] > 50);
+  const w = solveJoints(r.joints, 1); assert.ok(w.drawer.elements[13] < -50); // joints usable by solveJoints
+  const ac = new AbortController(); ac.abort();
+  await assert.rejects(autoAssemble(parts, { signal: ac.signal }), (e) => e.name === 'AbortError');
+  const ac2 = new AbortController();
+  await assert.rejects(autoAssemble(parts, { signal: ac2.signal, onProgress: () => ac2.abort() }), (e) => e.name === 'AbortError');
 }
 console.log('unit checks OK');
 

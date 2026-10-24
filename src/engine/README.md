@@ -55,3 +55,45 @@ a collision whose points all fall in a matching box should be shown as "expected
 ## Test
 `npm test` (= `node src/engine/engine.test.js`). Defaults to 41 steps (steps=40) and 0.3 mm tolerance, the same as the UI. Override with env `STEPS` / `TOL`.
 The test fails on any collision or near miss (gap < tolerance) that isn't covered by the preset's `expected` boxes.
+
+## autoAssemble (heuristic auto-placement + joint inference)
+
+```js
+import { autoAssemble, autoAssembleAsync } from './src/engine/index.js';
+const r = await autoAssemble(parts, { poses, base, clearance: 0.3, onProgress, signal });
+// autoAssembleAsync(parts, opts): same result, runs in a module Worker in the browser (Node: same as autoAssemble)
+```
+- `parts`: `[{id, geometry}]`. `opts.poses`: current poses `{id: Matrix4|16 numbers}` (missing = identity). `opts.base`: the part id to keep fixed; by default the part with the largest volume. `opts.clearance`: the gap left when a part is seated into a cavity (default 0.3 mm). `opts.trustInPlace=false` skips pass 1.
+- `onProgress(done, total, message)`. `signal`: an AbortSignal, checked between parts. The promise rejects with `AbortError`, and the Worker is terminated.
+- Returns:
+  - `poses: [{id, matrix (16 numbers, column-major), confidence 0..1, reason, note}]`, in the base part's frame as given.
+  - `joints: [{part, type: 'fixed'|'slider'|'hinge', offset?, parent?, axis?, origin?, range?, confidence, reason, note}]`. These feed straight into `solveJoints`. Each part gets a `fixed` joint whose `offset` is its pose (relative to `parent` when it rides on a moving part), followed by its motion joint in world axes. Slider ranges are in mm and hinge ranges in degrees.
+  - `guesses: [{part, matedTo, poseConfidence, joint, jointConfidence, reason, note}]`, `mode: 'in-place'|'search'`, `base`, `collisions` (pairs from `checkPose`, tolerance 0), `timeMs`.
+  - `note` is human-readable, e.g. `Drawer: slides 90 mm out along −Y`.
+- **Pass 1, in-place:** if the given poses already look assembled, they are kept and only joints are inferred. "Assembled" means every part's bbox (+2 mm) touches another part and no part has more than 3 % voxel overlap. This is the usual case for STLs exported from one CAD file in shared coordinates.
+- **Pass 2, search:** used when pass 1 fails.
+  - Each part gets a solid voxel grid (Z-raycast parity, about 1 mm voxels). Cavities are found as empty voxels enclosed on at least 5 sides (pockets) or on 4 sides with an opposite pair open (slots/holes).
+  - Parts are placed from largest to smallest. Each part tries all 24 axis-aligned rotations × (cavity-fit alignments + assembly-face abutments).
+  - Candidates are scored as surface contact within about 1 mm minus 25 × core overlap, then refined in ±2-voxel steps. A part with no acceptable placement is left where it was, with confidence 0.
+- **Joints:**
+  - Pin- or fastener-sized parts are `fixed`. They get a `parent` when they ride on a moving part.
+  - If a pin passes through a part and the part can swing ≥ 6° about the pin axis → `hinge`, with the range set to the free swing.
+  - If one translation direction is free (≥ 2 mm, perpendicular directions less than half that) and the part sits more than 50 % inside its mate's bbox, or its travel is bounded → `slider`. The range is the travel, or the insertion depth if the part can slide all the way out.
+  - Everything else → `fixed`.
+  - `path` joints (pins in curved slots) are **not** inferred.
+- **Accuracy:** run `node src/engine/assemble.test.js [seed]` (not part of `npm test`). Each preset is scrambled with 24-rotation + ±200 mm moves. A part counts as correct when its centroid and bbox are within 1.5 mm of the truth, relative to the base. Typical results:
+
+  | preset | in-place poses / joints | scrambled poses / joints | time |
+  |---|---|---|---|
+  | v1 | 3/3 / 3/3 | 2/3 / 3/3 | ~0.7 s |
+  | v2 | 3/3 / 3/3 | 1/3 / 3/3 | ~0.5 s |
+  | v3 | 10/10 / 5/10 | 1/10 / 3/10 | ~0.5 s / ~1.9 s |
+
+- **Limits:**
+  - Only axis-aligned orientations are tried.
+  - Backplates on dovetails are not seated (only flat-face abutment is tried).
+  - Small identical parts such as pins end up in arbitrary holes.
+  - Slider ranges are geometric (insertion depth), not design limits. For example, the v1 drawer gets 90 mm where the design value is 80 mm.
+  - Tilt-out `path` motion is not detected (the v3 drawer comes out `fixed`).
+  - Hinge range stops at the first voxel overlap (the v3 lever gets 6° where the design value is 12.8°).
+  - Pins are reported as `fixed` with no `parent` when their mate's motion was not inferred.
