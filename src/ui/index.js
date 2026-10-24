@@ -27,7 +27,7 @@ export function mount(root) {
      <div class="row"><b style="font-size:16px">Mechanism Tester</b></div>
      <div class="row"><button data-a="open">Open files</button><button class="sec" data-a="home">Samples</button></div>
      <div class="row"><button class="sec" data-a="save">Save project</button><button class="sec" data-a="load">Load project</button></div>
-     <input type="file" multiple accept=".stl,.3mf" hidden data-f="parts"><input type="file" accept=".json" hidden data-f="proj">
+     <input type="file" multiple accept=".stl,.3mf,model/stl,model/3mf,application/sla,application/vnd.ms-pki.stl,application/octet-stream" hidden data-f="parts"><input type="file" accept=".json,application/json,*/*" hidden data-f="proj">
      <h2>Parts</h2><div data-s="parts"><div class="hint">No parts yet.</div></div>
      <h2>Motions (joints)</h2><div data-s="joints"></div><button data-a="addj">+ Add motion</button>
      <h2>Help</h2><div class="hint" data-s="help">${HELP}</div>
