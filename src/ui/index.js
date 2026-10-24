@@ -93,7 +93,7 @@ export function mount(root) {
     if (/\.3mf$/i.test(name)) {
       const group = new ThreeMFLoader().parse(buf); group.updateMatrixWorld(true);
       const out = []; let k = 0;
-      group.traverse(o => { if (o.isMesh) { const g = o.geometry.clone().applyMatrix4(o.matrixWorld); g.computeVertexNormals(); out.push(addPart(k++ ? `${name}#${k}` : name, g, { ...opts, file: name })); } });
+      group.traverse(o => { if (o.isMesh) { const g = o.geometry.clone().applyMatrix4(o.matrixWorld); g.computeVertexNormals(); let nm = ''; for (let q = o; q && q !== group && !nm; q = q.parent) nm = (q.name || '').trim(); const key = k++ ? `${name}#${k}` : name; out.push(addPart(key, g, { ...opts, file: name, name: opts.name || (nm && !/^(mesh|object|build)?\s*\d*$/i.test(nm) ? nm : key) })); } });
       return out;
     }
     return [addPart(name, await loadSTL(buf), opts)];
