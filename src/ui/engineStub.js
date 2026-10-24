@@ -65,3 +65,15 @@ export function sweep(parts, joints, opts = {}) {
   for (let i = 0; i <= steps; i++) { const t = i / steps, poses = solveJoints(joints, t); out.push({ t, poses, ...checkPose(parts, poses, opts) }); }
   return out;
 }
+
+// autoAssemble(parts, opts) stub: keeps every part where it is, suggests no joints.
+// Yields to the event loop per part so the UI spinner keeps animating.
+export async function autoAssemble(parts, { onProgress, signal } = {}) {
+  const poses = [];
+  for (let i = 0; i < parts.length; i++) {
+    if (signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+    poses.push({ id: parts[i].id, matrix: new THREE.Matrix4().toArray(), confidence: 1, reason: 'parts already positioned' });
+    onProgress?.(i + 1, parts.length); await new Promise(r => setTimeout(r, 0));
+  }
+  return { poses, joints: [], source: 'stub' };
+}

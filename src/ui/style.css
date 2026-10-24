@@ -27,3 +27,11 @@
   .mt aside{border:0}
   .mt .view{min-height:60vh}
 }
+.mt .auto-item{border-top:1px solid #3a3a3a;padding:4px 0}
+.mt .auto-item.undone{opacity:.55}
+.mt .conf{font-size:11px;padding:1px 6px;border-radius:9px;margin-left:auto;text-transform:capitalize}
+.mt .conf.high{background:#1f5e2c;color:#bff5c8}.mt .conf.medium{background:#6a5612;color:#ffe9a0}.mt .conf.low{background:#6e2323;color:#ffc4c4}
+.mt .spin{width:14px;height:14px;border:2px solid #557;border-top-color:#8af;border-radius:50%;animation:mtspin .8s linear infinite}
+@keyframes mtspin{to{transform:rotate(360deg)}}
+.mt button:disabled{opacity:.5;cursor:wait}
+@media (max-width:900px){.mt .auto-item button{padding:9px 14px;min-height:40px}}

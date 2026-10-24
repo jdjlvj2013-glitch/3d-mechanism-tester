@@ -2,7 +2,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { ThreeMFLoader } from 'three/examples/jsm/loaders/3MFLoader.js';
-import { checkPose, solveJoints, sweepAsync, classify, loadSTL, engineInfo, toXYZ } from './engine.js';
+import { checkPose, solveJoints, sweepAsync, classify, loadSTL, engineInfo, toXYZ, autoAssemble } from './engine.js';
 import { listPresets } from './presets.js';
 import './style.css';
 
@@ -25,7 +25,8 @@ export function mount(root) {
   const app = el(`<div class="mt">
    <aside class="l">
      <div class="row"><b style="font-size:16px">Mechanism Tester</b></div>
-     <div class="row"><button data-a="open">Open files</button><button class="sec" data-a="home">Samples</button></div>
+     <div class="row"><button data-a="open">Open files</button><button class="sec" data-a="home">Samples</button><button data-a="auto" title="Guess how the parts fit together">Auto-assemble</button></div>
+     <div data-s="auto"></div>
      <div class="row"><button class="sec" data-a="save">Save project</button><button class="sec" data-a="load">Load project</button></div>
      <input type="file" multiple hidden data-f="parts"><input type="file" accept=".json,application/json,*/*" hidden data-f="proj">
      <h2>Parts</h2><div data-s="parts"><div class="hint">No parts yet.</div></div>
@@ -251,6 +252,58 @@ export function mount(root) {
     html += `<div class="hint">${res.length} positions checked in ${(ms / 1000).toFixed(1)} s.</div>`;
     out.innerHTML = html; out.querySelectorAll('[data-t]').forEach(b => b.onclick = () => { S.playing = false; q('[data-a=play]').textContent = '▶'; setT(+b.dataset.t); });
   }
+  // ---------- auto-assemble (review: each guess applied as a fixed-offset pose joint or a motion joint) ----------
+  const lvl = (c) => (c >= 0.75 ? 'high' : c >= 0.4 ? 'medium' : 'low');
+  const esc = (t) => String(t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  let autoRun = 0;
+  function autoRebuild() {
+    const A = S.auto; if (!A) return;
+    const live = A.items.filter(i => i.status !== 'undone'), mine = new Set(A.items.map(i => i.joint));
+    const posed = new Set(live.filter(i => i.kind === 'pose').map(i => i.part));
+    const extra = S.joints.filter(j => !A.snapshot.includes(j) && !mine.has(j));
+    S.joints = [...A.snapshot.filter(j => !(posed.has(j.part) && j.type === 'fixed' && !j.parent)), ...live.map(i => i.joint), ...extra];
+    for (const p of S.parts) p.fixed = A.fixed[p.id] ?? p.fixed;
+    live.filter(i => i.kind === 'joint' && i.joint.type !== 'fixed').forEach(i => { const p = S.parts.find(x => x.id === i.part); if (p) p.fixed = false; });
+    renderAll(); renderAuto();
+  }
+  function renderAuto() {
+    const box = q('[data-s=auto]'), A = S.auto;
+    if (!A) { box.innerHTML = ''; return; }
+    const pn = (id) => esc(S.parts.find(p => p.id === id)?.name || id);
+    box.innerHTML = `<div class="card auto"><div class="row"><b style="flex:1">Auto-assemble guesses</b><span class="badge">${A.source === 'engine' ? "Gram's engine" : 'stub'}</span></div>
+      ${A.items.length ? '' : '<div class="hint">No guesses returned.</div>'}
+      ${A.items.map((it, k) => `<div class="auto-item ${it.status}" data-i="${k}"><div class="row"><b>${pn(it.part)}</b><span class="hint">${it.kind === 'pose' ? 'position' : esc(it.joint.type)}</span>
+        <span class="conf ${lvl(it.confidence)}" title="${Math.round(it.confidence * 100)}%">${lvl(it.confidence)}</span></div>
+        <div class="hint">${esc(it.reason)}</div>
+        <div class="row">${it.status === 'undone' ? '<span class="hint">Undone</span><button class="sec" data-k="redo">Re-apply</button>'
+          : it.status === 'accepted' ? '<span class="ok">✔ Accepted</span><button class="sec" data-k="undo">Undo</button>'
+          : '<button data-k="acc">Accept</button><button class="sec" data-k="undo">Undo</button>'}</div></div>`).join('')}
+      <div class="row"><button data-k="accall">Accept all</button><button class="sec" data-k="undoall">Undo all</button></div></div>`;
+    box.querySelectorAll('.auto-item').forEach(d => { const it = A.items[+d.dataset.i];
+      d.querySelectorAll('[data-k]').forEach(b => b.onclick = () => { it.status = b.dataset.k === 'acc' ? 'accepted' : b.dataset.k === 'undo' ? 'undone' : 'pending'; autoRebuild(); }); });
+    box.querySelector('[data-k=accall]').onclick = () => { A.items.forEach(i => i.status !== 'undone' && (i.status = 'accepted')); S.auto = null; renderAuto(); };
+    box.querySelector('[data-k=undoall]').onclick = () => { A.items.forEach(i => (i.status = 'undone')); autoRebuild(); S.joints = [...A.snapshot]; S.auto = null; renderAll(); renderAuto(); };
+  }
+  async function runAuto(impl) {
+    if (!S.parts.length) return alert('Add some parts first.');
+    if (S.auto) S.auto.items.forEach(i => i.status === 'pending' && (i.status = 'accepted'));
+    const run = ++autoRun, btn = q('[data-a=auto]'), box = q('[data-s=auto]');
+    btn.disabled = true; S.autoBusy = true;
+    box.innerHTML = '<div class="card row"><span class="spin"></span><span data-k="ap">Working out how the parts fit…</span></div>';
+    let res;
+    try {
+      const parts = S.parts.map(p => ({ id: p.id, name: p.name, geometry: p.geometry }));
+      res = await autoAssemble(parts, { onProgress: (d, t) => { const e = box.querySelector('[data-k=ap]'); if (e && run === autoRun) e.textContent = `Working out how the parts fit… ${d}/${t}`; } }, ...(impl ? [impl] : []));
+    } catch (e) { box.innerHTML = `<div class="bad">Auto-assemble failed: ${esc(e.message)}</div>`; return; }
+    finally { btn.disabled = false; S.autoBusy = false; }
+    if (run !== autoRun) return;
+    const items = [
+      ...res.poses.map(p => ({ kind: 'pose', part: p.id, confidence: p.confidence, reason: p.reason, status: 'pending', joint: { id: 'autopose_' + p.id, type: 'fixed', part: p.id, offset: p.matrix.toArray(), axis: [1, 0, 0], origin: [0, 0, 0], range: [0, 0], auto: true } })),
+      ...res.joints.map(j => ({ kind: 'joint', part: j.part, confidence: j.confidence, reason: j.reason, status: 'pending', joint: (({ confidence, reason, ...r }) => ({ ...r, auto: true }))(j) })),
+    ];
+    S.auto = { source: res.source, snapshot: [...S.joints], fixed: Object.fromEntries(S.parts.map(p => [p.id, p.fixed])), items };
+    S.lastAuto = res; autoRebuild(); frame();
+  }
   function renderAll() { renderParts(); renderJoints(); S.sweepAbort?.abort(); sweepRun++; S.sweepResult = null; q('[data-s=sweep]').innerHTML = ''; update(); }
 
   // ---------- project save/load ----------
@@ -312,7 +365,7 @@ export function mount(root) {
   const fParts = q('[data-f=parts]'), fProj = q('[data-f=proj]');
   fParts.onchange = () => { const fs = [...fParts.files].filter(f => /\.(stl|3mf)$/i.test(f.name)); if (fs.length) addFiles(fs); else if (fParts.files.length) alert('Please pick .stl or .3mf files.'); fParts.value = ''; };
   fProj.onchange = () => { if (fProj.files[0]) loadProjectFile(fProj.files[0]); fProj.value = ''; };
-  const actions = { open: () => fParts.click(), open2: () => fParts.click(), home: showStart, close: hideStart, save: saveProject, load: () => fProj.click(), addj: addJoint, sweep: runSweep,
+  const actions = { open: () => fParts.click(), open2: () => fParts.click(), home: showStart, close: hideStart, save: saveProject, load: () => fProj.click(), addj: addJoint, sweep: runSweep, auto: () => runAuto(),
     play: () => { S.playing = !S.playing; q('[data-a=play]').textContent = S.playing ? '⏸' : '▶'; } };
   app.addEventListener('click', (e) => { const a = e.target.closest('[data-a]')?.dataset.a; if (a && actions[a]) actions[a](); });
   q('[data-s=slider]').oninput = (e) => { S.t = e.target.value / 1000; update(); };
@@ -322,7 +375,7 @@ export function mount(root) {
   app.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.remove('over'); const fs = [...e.dataTransfer.files].filter(f => /\.(stl|3mf)$/i.test(f.name)); if (fs.length) addFiles(fs); else if (e.dataTransfer.files[0]?.name.endsWith('.json')) loadProjectFile(e.dataTransfer.files[0]); });
 
   // test hook (used by headless tests)
-  const api = { state: S, async addBuffer(name, buf) { await loadFile(name, buf); hideStart(); renderAll(); frame(); }, applyProject, setT, setTol, runSweep, listPresets, openPreset, frame, update };
+  const api = { state: S, async addBuffer(name, buf) { await loadFile(name, buf); hideStart(); renderAll(); frame(); }, applyProject, setT, setTol, runSweep, listPresets, openPreset, frame, update, runAuto, poses: () => Object.fromEntries(S.parts.map(p => [p.id, p.mesh.matrix.toArray()])) };
   window.__mechTester = api;
   return api;
 }
