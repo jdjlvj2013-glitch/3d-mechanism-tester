@@ -55,7 +55,8 @@ export function autoAssembleAsync(parts, opts = {}) {
   if (!(typeof Worker !== 'undefined' && typeof window !== 'undefined')) return autoAssemble(parts, opts);
   return new Promise((resolve, reject) => {
     const w = new Worker(new URL('./assemble.worker.js', import.meta.url), { type: 'module' });
-    const payload = parts.map((p) => { const g = p.geometry.index ? p.geometry.toNonIndexed() : p.geometry; return { id: p.id, position: new Float32Array(g.attributes.position.array) }; });
+    // send positions (+ index when present) only: indexed meshes stay indexed (≈3× less memory than toNonIndexed on phones)
+    const payload = parts.map((p) => { const g = p.geometry; return { id: p.id, position: new Float32Array(g.attributes.position.array), index: g.index ? Uint32Array.from(g.index.array) : null }; });
     const ser = { ...wopts, poses: wopts.poses && Object.fromEntries(Object.entries(wopts.poses).map(([k, m]) => [k, toMat(m).toArray()])) };
     w.onmessage = ({ data }) => {
       if (data.type === 'progress') onProgress?.(data.done, data.total, data.msg);
@@ -64,6 +65,6 @@ export function autoAssembleAsync(parts, opts = {}) {
     };
     w.onerror = (e) => { w.terminate(); reject(e); };
     signal?.addEventListener('abort', () => { w.terminate(); reject(aaAbort()); }, { once: true });
-    w.postMessage({ parts: payload, opts: ser }, payload.map((p) => p.position.buffer));
+    w.postMessage({ parts: payload, opts: ser }, payload.flatMap((p) => (p.index ? [p.position.buffer, p.index.buffer] : [p.position.buffer])));
   });
 }

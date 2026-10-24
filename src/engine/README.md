@@ -117,8 +117,14 @@ The objects in `public/models/v{1,2,3}_print_layout.3mf` carry their real part n
 
 ## Upright orientation (plate layouts)
 
-For print-plate inputs (`result.layout === 'plate'`; force it with `opts.orient: true`, or turn it off with `opts.orient: false`), one global rotation is applied to every pose and joint (axes, origins, keyframe offsets). The result faces forward like the presets: back at +Y, the drawer pulls out toward −Y, and +Z is up. The lowest point sits on z=0, and the base's XY centre is kept.
+The orientation is always evaluated, deterministically and identically on the main thread and in the worker (turn it off with `opts.orient: false`). For print-plate inputs (`result.layout === 'plate'`), and for assembled inputs that are not upright (or with `opts.orient: true`), one global rotation is applied to every pose and joint (axes, origins, keyframe offsets). The result faces forward like the presets: back at +Y, the drawer pulls out toward −Y, and +Z is up. The lowest point sits on z=0, and the base's XY centre is kept.
 - Back: the opposite of the drawer's pull-out direction (slider or path); if there is no drawer, the backplate's side.
 - Up: the push button's side; otherwise the SKADIS hooks (the rear-most backplate vertices sit near its top edge); otherwise the axis nearest the given +Z.
 
-`result.orient = { rotation: [16 numbers], reason }`, or `null` when not applied. Assembled (non-plate) inputs are left as given.
+`result.orient = { rotation: [16 numbers], reason }`, or `null` when no cue was found. Assembled inputs that are already upright keep their given pose; in that case the reason ends with "(already upright: kept given pose)".
+
+## Placement refine, expected contacts, performance
+- Flat parts (backplates) are slid into the face they mount on for as long as there is no overlap. This seats the v3 backplate on the housing's back (it was about 95 mm off before).
+- Collision-aware refine (`opts.refine: false` turns it off): each searched part (largest first; pins and small fasteners are skipped) is nudged by up to 1.5 mm along the base axes. A nudge is kept only if it reduces the number of parts it intersects and keeps at least 60 % of its contact.
+- `result.expected`: designed contacts in the preset `expected` format (`{a, b, box, reason}`, in the result's world frame): pins press-fitted in holes, and the backplate on the base back. Pass it to `classify(checkPose(...), result.expected)` so these show as amber rather than as errors.
+- Speed and memory: scoring uses an inlined voxel lookup (about 2.5× faster). The voxel grid drops its eroded core array after sampling. BVHs are reused through `geometry.boundsTree`. The worker receives indexed geometry (position + index), not a non-indexed copy.

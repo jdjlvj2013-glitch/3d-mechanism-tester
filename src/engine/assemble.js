@@ -64,7 +64,7 @@ function buildGrid(g) {
   G.near = near;
   const toP = (a) => { const step = Math.max(1, Math.floor(a.length / 2500)); const out = new Float32Array(Math.ceil(a.length / step) * 3); let j = 0;
     for (let i = 0; i < a.length; i += step) { out[j++] = o.x + (a[i][0] + 0.5) * r; out[j++] = o.y + (a[i][1] + 0.5) * r; out[j++] = o.z + (a[i][2] + 0.5) * r; } return out.subarray(0, j); };
-  G.corePts = toP(corePts); G.surfPts = toP(surf); G.volume = nOcc * r ** 3;
+  G.corePts = toP(corePts); G.surfPts = toP(surf); G.volume = nOcc * r ** 3; delete G.core; // only the sampled points are needed (saves memory)
   G.lookup = (arr, p) => { const x = Math.floor((p.x - o.x) / r), y = Math.floor((p.y - o.y) / r), z = Math.floor((p.z - o.z) / r);
     return x >= 0 && y >= 0 && z >= 0 && x < nx && y < ny && z < nz && arr[x + nx * (y + ny * z)]; };
   G.cavities = findCavities(G);
@@ -153,6 +153,22 @@ const worldHoles = (P) => holesOf(P.G).map((h) => {
 });
 
 // ---------- scoring ----------
+/** number of points (flat xyz array) that land in a set cell of grid G's array arr after transform m (inlined for speed). */
+function countIn(pts, m, G, arr) {
+  const e = m.elements, ir = 1 / G.r, nx = G.nx, ny = G.ny, nz = G.nz, nxy = nx * ny;
+  const a0 = e[0] * ir, a1 = e[4] * ir, a2 = e[8] * ir, a3 = (e[12] - G.o.x) * ir;
+  const b0 = e[1] * ir, b1 = e[5] * ir, b2 = e[9] * ir, b3 = (e[13] - G.o.y) * ir;
+  const c0 = e[2] * ir, c1 = e[6] * ir, c2 = e[10] * ir, c3 = (e[14] - G.o.z) * ir;
+  let n = 0;
+  for (let i = 0; i < pts.length; i += 3) {
+    const px = pts[i], py = pts[i + 1], pz = pts[i + 2];
+    const x = Math.floor(a0 * px + a1 * py + a2 * pz + a3); if (x < 0 || x >= nx) continue;
+    const y = Math.floor(b0 * px + b1 * py + b2 * pz + b3); if (y < 0 || y >= ny) continue;
+    const z = Math.floor(c0 * px + c1 * py + c2 * pz + c3); if (z < 0 || z >= nz) continue;
+    if (arr[x + nx * y + nxy * z]) n++;
+  }
+  return n;
+}
 const _p = V(), _m = new THREE.Matrix4();
 /** overlap = core pts of A inside core of others; contact = surface pts of A within ~1 mm of others. M: rel poses. */
 function score(A, MA, others, skip) {
@@ -163,8 +179,7 @@ function score(A, MA, others, skip) {
     if (!bbA.intersectsBox(B.G.bb.clone().applyMatrix4(B.M))) continue;
     _m.copy(B.M).invert().multiply(MA); let o = 0, c = 0;
     const cp = A.G.corePts, sp = A.G.surfPts;
-    for (let i = 0; i < cp.length; i += 3) { _p.set(cp[i], cp[i + 1], cp[i + 2]).applyMatrix4(_m); if (B.G.lookup(B.G.occ, _p)) o++; }
-    for (let i = 0; i < sp.length; i += 3) { _p.set(sp[i], sp[i + 1], sp[i + 2]).applyMatrix4(_m); if (B.G.lookup(B.G.near, _p)) c++; }
+    o = countIn(cp, _m, B.G, B.G.occ); c = countIn(sp, _m, B.G, B.G.near);
     over += o; cont += c; perOther[B.id] = { o, c };
   }
   const of = over / (A.G.corePts.length / 3 || 1), cf = cont / (A.G.surfPts.length / 3 || 1);
@@ -447,7 +462,7 @@ export async function autoAssemble(parts, opts = {}) {
       const all = candidates(A, placed, clearance).map((C) => ({ M: C, s: sc(C, C.bonus, !!C.face), face: C.face, bonus: C.bonus, hole: C.hole, holeAxis: C.holeAxis }));
       all.sort((x, y) => y.s.s - x.s.s); let best = all[0] || null;
       // mating faces with tongues/dovetails: slide face candidates into the assembly while contact grows and overlap stays tiny
-      for (const c of [...all.filter((c) => c.face).slice(0, 12), ...all.filter((c) => c.face && c.face.flat && c.bonus).slice(0, 24)]) {
+      for (const c of [...all.filter((c) => c.face).slice(0, 12), ...all.filter((c) => c.face && c.face.flat && c.s.of < 0.01).slice(0, 160)]) {
         const step = A.G.r / 2, n = Math.ceil(Math.min(0.4 * c.face.sz, 15) / step);
         for (let k = 1; k <= n; k++) {
           const d = V(); d.setComponent(c.face.a, -c.face.side * k * step);
@@ -474,7 +489,33 @@ export async function autoAssemble(parts, opts = {}) {
     }
   }
 
-  // matedTo = neighbour with most contact
+  // collision-aware refine: placements come from a ~0.4–1 mm voxel score, so neighbours often interpenetrate by a
+  // fraction of a mm (checkPose counts any triangle crossing). Nudge each searched part (largest first) by ≤1.5 mm
+  // along the base axes to reduce the number of parts it intersects, keeping ≥60 % of its contact.
+  if (!inPlace && opts.refine !== false) {
+    const keptSet = new Set(keep.kept.map((q) => q.id)), bvhOf = (q) => q.geometry.boundsTree || (q.geometry.boundsTree = new MeshBVH(q.geometry));
+    const hits = (p, M) => { const bb = p.G.bb.clone().applyMatrix4(M); let n = 0;
+      for (const q of P) { if (q === p || q.unmatched || !bb.intersectsBox(worldBox(q))) continue;
+        if (bvhOf(q).intersectsGeometry(p.geometry, q.M.clone().invert().multiply(M))) n++; } return n; };
+    const order = P.filter((p) => p !== base && !p.unmatched && !keptSet.has(p.id) && !pinAxis(p) && !(worldBox(p).getSize(V()).toArray().every((v) => v < 25) && p.G.volume < 0.01 * base.G.volume)) // pins / small fasteners: press fits, reported in result.expected.sort((a, b) => b.G.volume - a.G.volume);
+    let moved = 0;
+    for (const p of order) {
+      let n0 = hits(p, p.M); if (!n0) continue;
+      const cf0 = score(p, p.M, P.filter((q) => q !== p)).cf, M0 = p.M.clone(), off = V();
+      for (const st of [1, 0.5, 0.25]) {
+        let improved = true;
+        while (improved && n0) { improved = false;
+          for (let a = 0; a < 3 && !improved; a++) for (const sg of [1, -1]) {
+            const d = off.clone(); d.setComponent(a, d.getComponent(a) + sg * st); if (d.length() > 1.5) continue;
+            const M = new THREE.Matrix4().makeTranslation(d.x, d.y, d.z).multiply(M0), n = hits(p, M); if (n >= n0) continue;
+            if (score(p, M, P.filter((q) => q !== p)).cf < 0.6 * cf0) continue;
+            off.copy(d); p.M = M; n0 = n; improved = true; break; }
+        }
+      }
+      if (off.lengthSq()) { moved++; reasons[p.id] += `; refined by [${off.toArray().map((v) => +v.toFixed(2))}] mm to clear neighbours`; }
+    }
+  }
+
   for (const p of P) {
     const s = score(p, p.M, P.filter((q) => q !== p));
     p.matedTo = Object.entries(s.perOther).sort((a, b) => b[1].c - a[1].c).find(([, v]) => v.c > 0)?.[0] ?? null;
@@ -602,7 +643,9 @@ export async function autoAssemble(parts, opts = {}) {
   // ---- upright orientation (plate layouts, or opts.orient): one global rotation so the result faces forward like the
   // presets: backplate / back at +Y, drawer pulls out toward −Y (viewer), Z up (SKADIS hooks at the top), lowest point on z=0.
   let orient = null;
-  if ((plate && opts.orient !== false) || opts.orient === true) {
+  // Always evaluated (deterministic; same result on main thread and in the worker) unless opts.orient === false; for
+  // non-plate inputs that are already upright it is a no-op, so re-running on an assembled result keeps it in place.
+  if (opts.orient !== false) {
     const snap = (v, not) => { let b = null; for (let a = 0; a < 3; a++) for (const s of [1, -1]) { const d = V(); d.setComponent(a, s); if (not && Math.abs(d.dot(not)) > 0.5) continue; if (!b || d.dot(v) > b.dot(v)) b = d; } return b; };
     const ctr = (q) => worldBox(q).getCenter(V()), bc = ctr(base), bsz0 = worldBox(base).getSize(V()).toArray().sort((a, b) => b - a);
     const bp = P.find((q) => q !== base && !q.unmatched && J[q.id].type === 'fixed' && !J[q.id].parent && (() => { const z = worldBox(q).getSize(V()).toArray().sort((a, b) => b - a); return z[2] < 0.25 * z[1] && z[0] * z[1] > 0.4 * bsz0[0] * bsz0[1]; })());
@@ -629,8 +672,11 @@ export async function autoAssemble(parts, opts = {}) {
       const Gm = new THREE.Matrix4().makeBasis(x, back, up).transpose();
       const bb = new THREE.Box3(); for (const q of P) if (!q.unmatched) bb.union(worldBox(q).applyMatrix4(Gm));
       const c0 = worldBox(base).applyMatrix4(baseW).getCenter(V()), c1 = worldBox(base).applyMatrix4(Gm).getCenter(V());
-      baseW = new THREE.Matrix4().makeTranslation(c0.x - c1.x, c0.y - c1.y, -bb.min.z).multiply(Gm);
-      orient = { rotation: Gm.toArray(), reason: why2.join(', ') };
+      const Rg = new THREE.Matrix4().extractRotation(baseW), same = Gm.elements.every((v, i) => Math.abs(v - Rg.elements[i]) < 1e-3);
+      if (plate || !same || opts.orient === true) {
+        baseW = new THREE.Matrix4().makeTranslation(c0.x - c1.x, c0.y - c1.y, -bb.min.z).multiply(Gm);
+        orient = { rotation: Gm.toArray(), reason: why2.join(', ') + (plate ? '' : same ? '' : ' (input was not upright: re-oriented)') };
+      } else orient = { rotation: Gm.toArray(), reason: why2.join(', ') + ' (already upright: kept given pose)' };
     }
   }
 
@@ -665,6 +711,17 @@ export async function autoAssemble(parts, opts = {}) {
     guesses.push({ part: p.id, role: roles[p.id], matedTo: p.matedTo, poseConfidence: p.conf ?? 0, joint: j.parent ? 'fixed(parent ' + j.parent + ')' : j.type, jointConfidence: j.confidence, reason: reasons[p.id] + ' | ' + j.reason, note: j.note || note });
   }
   const cp = checkPose(P, W, { tolerance: 0 });
-  return { poses, joints, guesses, roles, layout: plate ? 'plate' : 'assembly', orient, mode: inPlace ? 'in-place' : keep.kept.length > 1 ? 'mixed' : 'search', kept: keep.kept.map((p) => p.id), pass1: { frame, rejected: why }, base: base.id, collisions: cp.collisions.map(({ a, b }) => ({ a, b })), timeMs: Date.now() - t0 };
+  // designed contacts (preset `expected` format, world frame of the result): pins pressed into holes, backplate on the
+  // base's back face. The UI can pass these to classify(); everything else in `collisions` is a real problem.
+  const expected = [];
+  for (const { a, b } of cp.collisions) {
+    const ra = roles[a], rb = roles[b], why = ra === 'pin' || rb === 'pin' ? `pin ${ra === 'pin' ? pretty(a) : pretty(b)} press-fit in its hole`
+      : [ra, rb].includes('base') && [ra, rb].includes('backplate') ? 'backplate mounted flush on the base back (dovetail/press contact)' : null;
+    if (!why) continue;
+    const pa = P.find((q) => q.id === a), pb = P.find((q) => q.id === b);
+    const bx = pa.G.bb.clone().applyMatrix4(W[a]).intersect(pb.G.bb.clone().applyMatrix4(W[b])).expandByScalar(0.5);
+    expected.push({ a, b, box: [bx.min.toArray().map((v) => +v.toFixed(2)), bx.max.toArray().map((v) => +v.toFixed(2))], reason: why });
+  }
+  return { poses, joints, guesses, roles, expected, layout: plate ? 'plate' : 'assembly', orient, mode: inPlace ? 'in-place' : keep.kept.length > 1 ? 'mixed' : 'search', kept: keep.kept.map((p) => p.id), pass1: { frame, rejected: why }, base: base.id, collisions: cp.collisions.map(({ a, b }) => ({ a, b })), timeMs: Date.now() - t0 };
 }
 
