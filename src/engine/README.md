@@ -68,32 +68,32 @@ const r = await autoAssemble(parts, { poses, base, clearance: 0.3, onProgress, s
 - Returns:
   - `poses: [{id, matrix (16 numbers, column-major), confidence 0..1, reason, note}]`, in the base part's frame as given.
   - `joints: [{part, type: 'fixed'|'slider'|'hinge', offset?, parent?, axis?, origin?, range?, confidence, reason, note}]`. These feed straight into `solveJoints`. Each part gets a `fixed` joint whose `offset` is its pose (relative to `parent` when it rides on a moving part), followed by its motion joint in world axes. Slider ranges are in mm and hinge ranges in degrees.
-  - `guesses: [{part, matedTo, poseConfidence, joint, jointConfidence, reason, note}]`, `mode: 'in-place'|'search'`, `base`, `collisions` (pairs from `checkPose`, tolerance 0), `timeMs`.
+  - `guesses: [{part, matedTo, poseConfidence, joint, jointConfidence, reason, note}]`, `mode: 'in-place'|'mixed'|'search'`, `kept` (ids kept by pass 1), `pass1: {frame: 'poses'|'raw', rejected: {id: reason}}`, `base`, `collisions` (pairs from `checkPose`, tolerance 0), `timeMs`.
   - `note` is human-readable, e.g. `Drawer: slides 90 mm out along −Y`.
-- **Pass 1, in-place:** if the given poses already look assembled, they are kept and only joints are inferred. "Assembled" means every part's bbox (+2 mm) touches another part and no part has more than 3 % voxel overlap. This is the usual case for STLs exported from one CAD file in shared coordinates.
-- **Pass 2, search:** used when pass 1 fails.
+- **Pass 1, in-place (per part):** both `opts.poses` and the raw STL coordinates (identity) are tried; the frame keeping more parts wins. Starting from the base, a part is kept if its bbox (+1 mm) touches a kept part, its voxel overlap is ≤ 3 %, and it has contact (or sits nested inside a kept part, e.g. a pin in a hole). All kept → `in-place`; some kept → `mixed` (only the rest are searched); else `search`. Rejection reasons are in `pass1.rejected` and prefixed to each part's `reason`.
+- **Pass 2, search:** places the parts pass 1 did not keep. Besides cavity fits and face abutments, it tries: back-face placement (opposite the base's opening, pushed in until seated, so dovetail plates seat); small parts centred in holes; rods with their shaft through a guide hole; parts with their own holes aligned hole-to-hole with coaxial holes (lever on its pivot).
   - Each part gets a solid voxel grid (Z-raycast parity, about 1 mm voxels). Cavities are found as empty voxels enclosed on at least 5 sides (pockets) or on 4 sides with an opposite pair open (slots/holes).
   - Parts are placed from largest to smallest. Each part tries all 24 axis-aligned rotations × (cavity-fit alignments + assembly-face abutments).
   - Candidates are scored as surface contact within about 1 mm minus 25 × core overlap, then refined in ±2-voxel steps. A part with no acceptable placement is left where it was, with confidence 0.
 - **Joints:**
   - Pin- or fastener-sized parts are `fixed`. They get a `parent` when they ride on a moving part.
-  - If a pin passes through a part and the part can swing ≥ 6° about the pin axis → `hinge`, with the range set to the free swing.
-  - If one translation direction is free (≥ 2 mm, perpendicular directions less than half that) and the part sits more than 50 % inside its mate's bbox, or its travel is bounded → `slider`. The range is the travel, or the insertion depth if the part can slide all the way out.
+  - If a pin passes through a part and the part can swing ≥ 6° about the pin axis → `hinge`, with the range set to the free swing. A pin through the part takes priority over sliding; if a push rod/button blocks the swing, the swing is measured without it.
+  - If one translation direction is free (≥ 2 mm, perpendicular directions less than half that) and the part sits more than 50 % inside its mate's bbox, or its travel is bounded → `slider`. The range is the travel, or the insertion depth if the part can slide all the way out. A rod that only escapes backwards uses its bounded direction (stops at first contact). A drawer that can also push in a little gets a negative range start, e.g. v2 `[-4, 90]`.
   - Everything else → `fixed`.
   - `path` joints (pins in curved slots) are **not** inferred.
 - **Accuracy:** run `node src/engine/assemble.test.js [seed]` (not part of `npm test`). Each preset is scrambled with 24-rotation + ±200 mm moves. A part counts as correct when its centroid and bbox are within 1.5 mm of the truth, relative to the base. Typical results:
 
-  | preset | in-place poses / joints | scrambled poses / joints | time |
-  |---|---|---|---|
-  | v1 | 3/3 / 3/3 | 2/3 / 3/3 | ~0.7 s |
-  | v2 | 3/3 / 3/3 | 1/3 / 3/3 | ~0.5 s |
-  | v3 | 10/10 / 5/10 | 1/10 / 3/10 | ~0.5 s / ~1.9 s |
+  | preset | UI-style (raw STLs, identity poses) | in-place | scrambled | time (UI) |
+  |---|---|---|---|---|
+  | v1 | 3/3 / 3/3 | 3/3 / 3/3 | 3/3 / 3/3 | ~1.3 s |
+  | v2 | 3/3 / 3/3 | 3/3 / 3/3 | 3/3 / 3/3 | ~1.0 s |
+  | v3 (UI has one pin_drawer) | 7/7 / 5/7 | 10/10 / 5/10 | 2/10 / 6/10 | ~3.7 s |
 
 - **Limits:**
   - Only axis-aligned orientations are tried.
-  - Backplates on dovetails are not seated (only flat-face abutment is tried).
-  - Small identical parts such as pins end up in arbitrary holes.
+  - Identical parts (pins) may be swapped between equivalent holes; the test counts any instance as correct.
+  - The v3 button slider comes out as pull-out −Y ~93 mm (it rests against the lever, so the bounded push direction measures 0); design is +Y 4.6 mm.
   - Slider ranges are geometric (insertion depth), not design limits. For example, the v1 drawer gets 90 mm where the design value is 80 mm.
   - Tilt-out `path` motion is not detected (the v3 drawer comes out `fixed`).
-  - Hinge range stops at the first voxel overlap (the v3 lever gets 6° where the design value is 12.8°).
+  - Hinge range stops at the first voxel overlap (the v3 lever gets 6° where the design value is −12.8°).
   - Pins are reported as `fixed` with no `parent` when their mate's motion was not inferred.

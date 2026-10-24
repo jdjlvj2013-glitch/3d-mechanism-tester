@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { checkPose, solveJoints, sweep, sweepAsync, loadSTL, classify, autoAssemble, THREE } from './index.js';
+import { checkPose, solveJoints, sweep, sweepAsync, loadSTL, classify, autoAssemble, autoAssembleAsync, THREE } from './index.js';
 import { presets } from './presets/index.js';
 const root = fileURLToPath(new URL('../../public', import.meta.url));
 
@@ -41,6 +41,16 @@ const p = new THREE.Vector3(2, 0, 0).applyMatrix4(h.a); assert.ok(p.distanceTo(n
   await assert.rejects(autoAssemble(parts, { signal: ac.signal }), (e) => e.name === 'AbortError');
   const ac2 = new AbortController();
   await assert.rejects(autoAssemble(parts, { signal: ac2.signal, onProgress: () => ac2.abort() }), (e) => e.name === 'AbortError');
+}
+// UI-style autoAssemble call (as src/ui does): raw STLs, id = file name, identity poses, clearance 0.3, async
+if (existsSync(root + '/models/v1_housing.stl')) {
+  const ids = ['v1_housing', 'v1_drawer', 'v1_backplate'], parts = [], poses = {};
+  for (const id of ids) { parts.push({ id, geometry: await loadSTL(root + '/models/' + id + '.stl') }); poses[id] = new THREE.Matrix4().toArray(); }
+  const r = await autoAssembleAsync(parts, { poses, tolerance: 0.3, clearance: 0.3, onProgress: () => {} });
+  assert.ok(['in-place', 'mixed', 'search'].includes(r.mode) && r.pass1 && r.pass1.rejected, 'mode/pass1 reported');
+  assert.equal(r.mode, 'mixed'); assert.ok(r.pass1.rejected.v1_backplate, 'pass-1 rejection reason given');
+  const M = new THREE.Matrix4().fromArray(r.poses.find((q) => q.id === 'v1_backplate').matrix);
+  assert.ok(Math.abs(new THREE.Vector3().setFromMatrixPosition(M).y - 94.61) < 1.5, 'v1 backplate placed on the housing');
 }
 console.log('unit checks OK');
 

@@ -103,6 +103,55 @@ function findCavities(G) {
   return comps.sort((a, b) => b.count - a.count).slice(0, 12);
 }
 
+// Round-ish through/blind holes (pin holes, pivot bores, rod guides): empty voxels enclosed radially within ~6 mm,
+// grouped per axis. Local coordinates. Computed lazily (only when a small/holed part has to be placed).
+function findHoles(G) {
+  const { nx, ny, nz, occ, r } = G, st = [1, nx, nx * ny], dims = [nx, ny, nz], R = Math.max(2, Math.ceil(6 / r)), out = [];
+  for (let a = 0; a < 3; a++) {
+    const [b, c] = [0, 1, 2].filter((q) => q !== a), ok = new Uint8Array(occ.length);
+    const hit = (i, co, ax, sgn) => { for (let k = 1; k <= R; k++) { const v = co[ax] + sgn * k; if (v < 0 || v >= dims[ax]) return false; if (occ[i + sgn * k * st[ax]]) return true; } return false; };
+    for (let z = 0; z < nz; z++) for (let y = 0; y < ny; y++) for (let x = 0; x < nx; x++) {
+      const i = x + y * nx + z * nx * ny; if (occ[i]) continue; const co = [x, y, z];
+      if (hit(i, co, b, -1) && hit(i, co, b, 1) && hit(i, co, c, -1) && hit(i, co, c, 1)) ok[i] = 1;
+    }
+    const seen = new Uint8Array(occ.length), q = new Int32Array(occ.length);
+    for (let s0 = 0; s0 < ok.length; s0++) {
+      if (!ok[s0] || seen[s0]) continue; let h = 0, t = 0; q[t++] = s0; seen[s0] = 1; const mn = [1e9, 1e9, 1e9], mx = [-1, -1, -1];
+      while (h < t) {
+        const i = q[h++], co = [i % nx, ((i / nx) | 0) % ny, (i / (nx * ny)) | 0];
+        for (let k = 0; k < 3; k++) { mn[k] = Math.min(mn[k], co[k]); mx[k] = Math.max(mx[k], co[k]); }
+        for (let k = 0; k < 3; k++) for (const d of [-1, 1]) { const cc = co[k] + d; if (cc < 0 || cc >= dims[k]) continue; const j = i + d * st[k]; if (ok[j] && !seen[j]) { seen[j] = 1; q[t++] = j; } }
+      }
+      const eb = (mx[b] - mn[b] + 1) * r, ec = (mx[c] - mn[c] + 1) * r, L = (mx[a] - mn[a] + 1) * r;
+      if (t < 4 || eb > 13 || ec > 13 || Math.max(eb, ec) > 1.6 * Math.min(eb, ec) + 2 * r || L < 1.5 * r) continue;
+      const lo = V(...mn.map((v, k) => G.o.getComponent(k) + v * r)), hi = V(...mx.map((v, k) => G.o.getComponent(k) + (v + 1) * r));
+      out.push({ a, d: (eb + ec) / 2, len: L, center: lo.clone().add(hi).multiplyScalar(0.5), lo: lo.getComponent(a), hi: hi.getComponent(a) });
+    }
+  }
+  return out.sort((x, y) => y.len - x.len).slice(0, 24);
+}
+// Elongated part (rod / push button): longest local axis and the shaft's cross-section (middle 40-60% slab) centre + size.
+function rodOf(G) {
+  if ('rod' in G) return G.rod;
+  const { nx, ny, nz, occ, r } = G, dims = [nx, ny, nz], sz = G.bb.getSize(V()).toArray(), idx = [0, 1, 2].sort((a, b) => sz[b] - sz[a]), a = idx[0];
+  G.rod = null; if (sz[a] < 2.5 * sz[idx[1]] && sz[a] < 40) return null;
+  const lo = Math.floor(dims[a] * 0.4), hi = Math.ceil(dims[a] * 0.6), mn = [1e9, 1e9, 1e9], mx = [-1e9, -1e9, -1e9];
+  for (let z = 0; z < nz; z++) for (let y = 0; y < ny; y++) for (let x = 0; x < nx; x++) {
+    const c = [x, y, z]; if (c[a] < lo || c[a] > hi || !occ[x + nx * (y + ny * z)]) continue;
+    for (let k = 0; k < 3; k++) { mn[k] = Math.min(mn[k], c[k]); mx[k] = Math.max(mx[k], c[k] + 1); }
+  }
+  if (mn[0] > mx[0]) return null;
+  const center = V(...[0, 1, 2].map((k) => G.o.getComponent(k) + (mn[k] + mx[k]) / 2 * r)); center.setComponent(a, G.bb.getCenter(V()).getComponent(a));
+  const w = Math.max(...[0, 1, 2].filter((k) => k !== a).map((k) => (mx[k] - mn[k]) * r));
+  return (G.rod = w < 14 ? { a, center, w } : null);
+}
+const holesOf = (G) => (G.holes ||= findHoles(G));
+const worldHoles = (P) => holesOf(P.G).map((h) => {
+  const c = h.center.clone().applyMatrix4(P.M), ax = worldAxis(P.M, { a: h.a, s: 1 }), lo = c.clone(), hi = c.clone();
+  lo.setComponent(h.a, h.lo); hi.setComponent(h.a, h.hi); lo.applyMatrix4(P.M); hi.applyMatrix4(P.M);
+  return { a: ax.a, d: h.d, center: c, lo: Math.min(lo.getComponent(ax.a), hi.getComponent(ax.a)), hi: Math.max(lo.getComponent(ax.a), hi.getComponent(ax.a)) };
+});
+
 // ---------- scoring ----------
 const _p = V(), _m = new THREE.Matrix4();
 /** overlap = core pts of A inside core of others; contact = surface pts of A within ~1 mm of others. M: rel poses. */
@@ -127,9 +176,12 @@ const worldBox = (P) => P.G.bb.clone().applyMatrix4(P.M);
 function candidates(A, placed, clr) {
   const out = [];
   const asmBox = new THREE.Box3(); placed.forEach((P) => asmBox.union(worldBox(P)));
+  // mounting face = side opposite the base's main cavity opening (e.g. back of a drawer housing)
+  const mc = placed[0].G.cavities[0], od = mc?.open[0] && worldAxis(placed[0].M, mc.open[0]), back = od && { a: od.a, s: -od.s };
   for (const R of ROTATIONS_24) {
     const rb = A.G.bb.clone().applyMatrix4(R), rs = rb.getSize(V());
-    const push = (target) => out.push(new THREE.Matrix4().makeTranslation(target.x - rb.min.x, target.y - rb.min.y, target.z - rb.min.z).multiply(R));
+    const push = (target, bonus = 0, face = null, hole = false) => out.push(Object.assign(new THREE.Matrix4().makeTranslation(target.x - rb.min.x, target.y - rb.min.y, target.z - rb.min.z)
+      .multiply(R), { bonus, face, hole }));
     const opts = (lo, hi, sz) => [lo + clr, hi - clr - sz, (lo + hi - sz) / 2];
     // into cavities of placed parts
     for (const P of placed) for (const c of P.G.cavities) {
@@ -145,6 +197,41 @@ function candidates(A, placed, clr) {
       });
       for (const x of per[0]) for (const y of per[1]) for (const z of per[2]) push(V(x, y, z));
     }
+    // small parts (pins, studs, rods) centred in holes of placed parts; parts with their own holes aligned hole-to-hole
+    const big = Math.max(rs.x, rs.y, rs.z), small = big < 25;
+    const WH = placed.flatMap((P) => worldHoles(P));
+    for (const h of WH) {
+      const [b, c2] = [0, 1, 2].filter((q) => q !== h.a);
+      if (small) {
+        if (rs.getComponent(b) > h.d + 4 && rs.getComponent(c2) > h.d + 4) continue;
+        const sz = rs.getComponent(h.a);
+        // coaxial holes (e.g. both bosses of a pivot, across parts): span them all
+        const co = WH.filter((g) => g.a === h.a && Math.abs(g.center.getComponent(b) - h.center.getComponent(b)) < 1 && Math.abs(g.center.getComponent(c2) - h.center.getComponent(c2)) < 1);
+        const slo = Math.min(...co.map((g) => g.lo)), shi = Math.max(...co.map((g) => g.hi));
+        for (const t of [slo, shi - sz, (slo + shi - sz) / 2, slo - 1.5, shi - sz + 1.5, h.lo - sz / 2, h.lo, h.hi - sz, (h.lo + h.hi - sz) / 2, h.hi - sz / 2, h.lo - sz + 1, h.hi - 1]) {
+          const tg = V(); tg.setComponent(b, h.center.getComponent(b) - rs.getComponent(b) / 2); tg.setComponent(c2, h.center.getComponent(c2) - rs.getComponent(c2) / 2); tg.setComponent(h.a, t);
+          push(tg, 0.15, null, true);
+        }
+      } else if (rodOf(A.G) && rodOf(A.G).w <= h.d + 2) {
+        // rod / push button shaft through a guide hole (spanning coaxial guides)
+        const rod = A.G.rod, ax = worldAxis(R, { a: rod.a, s: 1 }).a; if (ax !== h.a) continue;
+        const rc = rod.center.clone().applyMatrix4(R), len = rs.getComponent(h.a);
+        const co = WH.filter((g) => g.a === h.a && Math.abs(g.center.getComponent(b) - h.center.getComponent(b)) < 1 && Math.abs(g.center.getComponent(c2) - h.center.getComponent(c2)) < 1);
+        const slo = Math.min(...co.map((g) => g.lo)), shi = Math.max(...co.map((g) => g.hi)), bonus = 0.3 * Math.min(co.length, 3);
+        for (const d of [-10, -5, 0, 5, 10]) for (const endLo of [shi + d - len, slo - d]) {
+          const tg = h.center.clone(); tg.setComponent(h.a, endLo + len / 2); const c0 = rc.clone(); c0.setComponent(h.a, rb.min.getComponent(h.a) + len / 2);
+          out.push(Object.assign(new THREE.Matrix4().makeTranslation(tg.x - c0.x, tg.y - c0.y, tg.z - c0.z).multiply(R), { bonus, hole: true, holeAxis: h.a }));
+        }
+      } else for (const hA of holesOf(A.G).slice(0, 8)) {
+        if (Math.abs(hA.d - h.d) > 2.5) continue;
+        const ca = hA.center.clone().applyMatrix4(R), ax = worldAxis(R, { a: hA.a, s: 1 }).a; if (ax !== h.a) continue;
+        const half = (hA.hi - hA.lo) / 2, nco = WH.filter((g) => g.a === h.a && Math.abs(g.center.getComponent(b) - h.center.getComponent(b)) < 1 && Math.abs(g.center.getComponent(c2) - h.center.getComponent(c2)) < 1 && g.lo < h.hi + 15 && g.hi > h.lo - 15).length;
+        for (const along of [h.center.getComponent(h.a), h.lo - half, h.hi + half]) {
+          const tg = h.center.clone(); tg.setComponent(h.a, along);
+          out.push(Object.assign(new THREE.Matrix4().makeTranslation(tg.x - ca.x, tg.y - ca.y, tg.z - ca.z).multiply(R), { bonus: 0.3 * Math.min(nco, 3), hole: true }));
+        }
+      }
+    }
     // against faces of the current assembly
     for (let a = 0; a < 3; a++) for (const side of [-1, 1]) {
       const per = [0, 1, 2].map((b) => {
@@ -152,7 +239,8 @@ function candidates(A, placed, clr) {
         if (b === a) return [side < 0 ? lo - sz - clr : hi + clr];
         return [lo, hi - sz, (lo + hi - sz) / 2];
       });
-      for (const x of per[0]) for (const y of per[1]) for (const z of per[2]) push(V(x, y, z));
+      const bonus = back && back.a === a && back.s === side ? 0.15 : 0;
+      for (const x of per[0]) for (const y of per[1]) for (const z of per[2]) push(V(x, y, z), bonus, { a, side, sz: rs.getComponent(a), flat: rs.getComponent(a) <= Math.min(rs.x, rs.y, rs.z) + 1e-6 });
     }
   }
   return out;
@@ -162,13 +250,13 @@ function worldAxis(M, d) {
   const a = [0, 1, 2].reduce((b, i) => (Math.abs(v.getComponent(i)) > Math.abs(v.getComponent(b)) ? i : b), 0);
   return { a, s: Math.sign(v.getComponent(a)) };
 }
-function refine(A, M, placed) {
+function refine(A, M, placed, axes = [0, 1, 2]) {
   let best = M.clone(), bs = score(A, best, placed).s; const st = A.G.r;
   for (let it = 0; it < 4; it++) {
     let improved = false;
-    for (let a = 0; a < 3; a++) for (const d of [-2 * st, -st, st, 2 * st]) {
+    for (const a of axes) for (const d of [-2 * st, -st, st, 2 * st]) {
       const t = V(); t.setComponent(a, d); const C = new THREE.Matrix4().makeTranslation(t.x, t.y, t.z).multiply(best);
-      const s = score(A, C, placed).s; if (s > bs + 1e-4) { bs = s; best = C; improved = true; }
+      const s = score(A, C, placed).s; if (s > bs + 0.005) { bs = s; best = C; improved = true; }
     }
     if (!improved) break;
   }
@@ -214,34 +302,64 @@ export async function autoAssemble(parts, opts = {}) {
   const base = P.find((p) => p.id === opts.base) || byVol[0];
   const baseW = base.given.clone(), baseInv = baseW.clone().invert();
 
-  // pass 1: already assembled? (shared coordinates: boxes touch/nest, no big overlaps)
-  P.forEach((p) => { p.M = baseInv.clone().multiply(p.given); });
-  let inPlace = opts.trustInPlace !== false && P.length > 1;
-  const reasons = {};
-  if (inPlace) for (const p of P) {
-    const others = P.filter((q) => q !== p), bb = worldBox(p).expandByScalar(2);
-    if (!others.some((q) => bb.intersectsBox(worldBox(q)))) { inPlace = false; break; }
-    if (score(p, p.M, others).of > 0.03) { inPlace = false; break; }
-  }
-  if (inPlace) {
-    const raw = checkPose(P, Object.fromEntries(P.map((p) => [p.id, p.M])), { tolerance: 0 });
-    for (const p of P) { p.conf = 0.9; reasons[p.id] = 'kept: parts already in a plausible assembled arrangement (shared coordinates)'; }
-    P.rawCollisions = raw.collisions.length;
-  } else {
-    // pass 2: feature/fit search, largest first
-    base.M = new THREE.Matrix4(); base.conf = 1; reasons[base.id] = 'base (largest volume)' + (opts.base ? ' / user-specified' : '');
-    const placed = [base]; let k = 0;
-    for (const A of byVol.filter((p) => p !== base)) {
-      let best = null;
-      for (const C of candidates(A, placed, clearance)) {
-        const s = score(A, C, placed); if (!best || s.s > best.s.s) best = { M: C, s };
+  // pass 1: keep every part that already sits plausibly in the assembly (shared CAD coordinates), per part.
+  // Tried with opts.poses and with raw STL coordinates (identity); the variant keeping more parts wins.
+  const reasons = {}, why = {};
+  const tryKeep = (rel) => {
+    P.forEach((p) => { p.M = rel[p.id]; });
+    const kept = [base], rej = {}; let changed = true;
+    while (changed) {
+      changed = false;
+      for (const p of P) {
+        if (kept.includes(p)) continue;
+        const bb = worldBox(p), near = kept.filter((q) => bb.clone().expandByScalar(1).intersectsBox(worldBox(q)));
+        if (!near.length) { rej[p.id] = 'not touching the assembly (gap > 1 mm)'; continue; }
+        const sc = score(p, p.M, kept);
+        const nested = near.some((q) => worldBox(q).expandByScalar(1).containsBox(bb));
+        if (sc.of > 0.03) { const w = Object.entries(sc.perOther).sort((x, y) => y[1].o - x[1].o)[0]; rej[p.id] = `overlaps ${w[0]} (${(sc.of * 100).toFixed(1)}% of its volume)`; continue; }
+        if (sc.cf < 0.01 && !nested) { rej[p.id] = 'bbox touches but no surface within ~1 mm'; continue; }
+        kept.push(p); delete rej[p.id]; changed = true;
+      }
+    }
+    return { kept, rej };
+  };
+  let keep = { kept: [base], rej: {} }, frame = 'opts.poses';
+  if (opts.trustInPlace !== false && P.length > 1) {
+    const variants = [['opts.poses', Object.fromEntries(P.map((p) => [p.id, baseInv.clone().multiply(p.given)]))]];
+    if (P.some((p) => !p.given.equals(new THREE.Matrix4()))) variants.push(['raw STL coordinates', Object.fromEntries(P.map((p) => [p.id, new THREE.Matrix4()]))]);
+    let bestRel = null;
+    for (const [name, rel] of variants) { const k = tryKeep(rel); if (k.kept.length > keep.kept.length || !bestRel) { keep = k; frame = name; bestRel = rel; } }
+    P.forEach((p) => { p.M = bestRel[p.id]; });
+  } else P.forEach((p) => { p.M = baseInv.clone().multiply(p.given); });
+  const inPlace = keep.kept.length === P.length;
+  for (const p of keep.kept) { p.conf = p === base ? 1 : 0.9; reasons[p.id] = p === base ? `base (${opts.base ? 'user-specified' : 'largest volume'})` : `kept: already fits the assembly in ${frame}`; }
+  for (const [id, r] of Object.entries(keep.rej)) why[id] = r;
+  if (!inPlace) {
+    // pass 2: feature/fit search for the rest, largest first
+    const placed = [...keep.kept]; let k = 0;
+    for (const A of byVol.filter((p) => !placed.includes(p))) {
+      const asm = new THREE.Box3(); placed.forEach((q) => asm.union(worldBox(q))); const bv = (b) => { const z = b.getSize(V()); return z.x * z.y * z.z; }, av = bv(asm);
+      // flush with the assembly outline is preferred (small penalty for growing the overall bounding box)
+      const sc = (M, bonus, face = true) => { const s = score(A, M, placed); s.s += (bonus && s.cf > 0.05 ? bonus : 0) - (face ? 0.1 : 0) * (bv(asm.clone().union(A.G.bb.clone().applyMatrix4(M))) - av) / av; return s; };
+      const all = candidates(A, placed, clearance).map((C) => ({ M: C, s: sc(C, C.bonus, !!C.face), face: C.face, bonus: C.bonus, hole: C.hole, holeAxis: C.holeAxis }));
+      all.sort((x, y) => y.s.s - x.s.s); let best = all[0] || null;
+      // mating faces with tongues/dovetails: slide face candidates into the assembly while contact grows and overlap stays tiny
+      for (const c of [...all.filter((c) => c.face).slice(0, 12), ...all.filter((c) => c.face && c.face.flat && c.bonus).slice(0, 24)]) {
+        const step = A.G.r / 2, n = Math.ceil(Math.min(0.4 * c.face.sz, 15) / step);
+        for (let k = 1; k <= n; k++) {
+          const d = V(); d.setComponent(c.face.a, -c.face.side * k * step);
+          const M = new THREE.Matrix4().makeTranslation(d.x, d.y, d.z).multiply(c.M), s = sc(M, c.bonus);
+          if (s.of > c.s.of + 0.005) break;
+          if (s.s > best.s.s + 0.005) best = { M, s };
+        }
       }
       if (best && best.s.cf > 0.02 && best.s.of < 0.05) {
-        A.M = refine(A, best.M, placed); const s = score(A, A.M, placed);
+        A.M = best.hole ? (best.holeAxis !== undefined ? refine(A, best.M, placed, [best.holeAxis]) : best.M) : refine(A, best.M, placed);
+        const s = score(A, A.M, placed); // hole-aligned: keep the axis exact
         A.conf = +Math.max(0.05, Math.min(0.95, s.cf * 2 - s.of * 10)).toFixed(2);
-        reasons[A.id] = `best of ${ROTATIONS_24.length} rotations × cavity/face alignments: contact ${(s.cf * 100).toFixed(0)}% of surface, overlap ${(s.of * 100).toFixed(1)}%`;
+        reasons[A.id] = `${why[A.id] ? 'pass 1: ' + why[A.id] + '; ' : ''}best of ${ROTATIONS_24.length} rotations × cavity/face alignments: contact ${(s.cf * 100).toFixed(0)}% of surface, overlap ${(s.of * 100).toFixed(1)}%`;
         placed.push(A);
-      } else { A.M = A.M || new THREE.Matrix4(); A.conf = 0; A.unmatched = true; reasons[A.id] = 'no fitting placement found; left in place'; }
+      } else { A.M = A.M || new THREE.Matrix4(); A.conf = 0; A.unmatched = true; reasons[A.id] = `${why[A.id] ? 'pass 1: ' + why[A.id] + '; ' : ''}no fitting placement found; left in place`; }
       await tick(P.length + ++k, P.length * 3, `placed ${A.id}`);
     }
   }
@@ -265,9 +383,15 @@ export async function autoAssemble(parts, opts = {}) {
       const d = V(); d.setComponent(a, s); const ext = size.getComponent(a);
       trav.push({ a, s, d, ext, t: travel(p, P, d, ext * 1.2 + 2, skip) });
     }
-    trav.sort((x, y) => y.t - x.t); const best = trav[0];
-    const perp = trav.filter((x) => x.a !== best.a);
+    trav.sort((x, y) => y.t - x.t); let best = trav[0];
     const inside = mate ? (() => { const i = wb.clone().intersect(worldBox(mate)); return i.isEmpty() ? 0 : i.getSize(V()).toArray().reduce((m, v) => m * v, 1) / (size.x * size.y * size.z); })() : 0;
+    // a rod/button that only escapes backwards out of its hole moves along its bounded direction (stopped by the first part
+    // it hits, e.g. the lever); a drawer (mostly inside a cavity) keeps the pull-out direction and may also push in a bit.
+    let back = 0;
+    { const opp = trav.find((x) => x.a === best.a && x.s !== best.s);
+      if (best.t >= best.ext * 1.2 && opp && opp.t >= 2 && opp.t < opp.ext) { const onlyMate = mate ? travel(p, P, opp.d, opp.ext * 1.2 + 2, new Set(P.filter((q) => q !== mate).map((q) => q.id))) : opp.t;
+        if (inside > 0.5 && onlyMate <= opp.t + 1) back = +opp.t.toFixed(1); else { best = opp; best.stop = onlyMate > opp.t + 1; } } }
+    const perp = trav.filter((x) => x.a !== best.a);
     const escapes = best.t >= best.ext * 1.2;
     // hinge (checked first) about a pin passing through this part
     let hinge = null;
@@ -276,22 +400,26 @@ export async function autoAssemble(parts, opts = {}) {
       const sc = score(q, q.M, [p]); if (!sc.perOther[p.id] || sc.perOther[p.id].c < 3) continue;
       if (!wb.containsPoint(pa.center) && !wb.clone().expandByScalar(2).containsPoint(pa.center)) continue;
       const axis = V(); axis.setComponent(pa.a, 1); const sk = new Set([...skip, q.id]);
-      const plus = swing(p, P, axis, pa.center, 1, sk), minus = swing(p, P, axis, pa.center, -1, sk);
-      const m = Math.max(plus, minus); if (m < 6) continue;
+      let plus = swing(p, P, axis, pa.center, 1, sk), minus = swing(p, P, axis, pa.center, -1, sk), drv = '';
+      if (Math.max(plus, minus) < 6) { // blocked by a push rod/button that drives it: swing ignoring rods
+        const rods = P.filter((r2) => r2 !== p && r2 !== base && rodOf(r2.G)).map((r2) => r2.id);
+        if (rods.length) { const sk2 = new Set([...sk, ...rods]); plus = swing(p, P, axis, pa.center, 1, sk2); minus = swing(p, P, axis, pa.center, -1, sk2); drv = ` (driven by ${rods.join('/')})`; }
+      }
+      const m = Math.max(plus, minus); if (m < 6 && !(wb.containsPoint(pa.center) && m > 0)) continue;
       const sgn = plus >= minus ? 1 : -1;
       hinge = { type: 'hinge', axis: axis.toArray(), origin: pa.center.toArray().map((v) => +v.toFixed(2)), range: [0, sgn * m], confidence: 0.6,
-        reason: `pin-in-hole: ${q.id} (axis ${AX[pa.a]}) passes through; free swing ${plus}° / −${minus}°`,
+        reason: `pin-in-hole: ${q.id} (axis ${AX[pa.a]}) passes through; free swing ${plus}° / −${minus}°${drv}`,
         note: `${pretty(p.id)}: swings ${m}° about ${q.id} (${AX[pa.a]} axis)` };
       break;
     }
     J[p.id] = null;
-    if (!hinge && best.t >= 2 && perp.every((x) => x.t < 0.5 * best.t) && (inside > 0.5 || !escapes)) {
+    if (!hinge && best.t >= 2 && perp.every((x) => x.t < 0.5 * best.t || (x.t < best.ext * 1.2 && x.t <= 6)) && (inside > 0.5 || !escapes)) {
       let depth = best.t;
       if (escapes && mate) { const i = wb.clone().intersect(worldBox(mate)); depth = i.getSize(V()).getComponent(best.a); }
       depth = +Math.min(depth, best.t).toFixed(1);
-      J[p.id] = { type: 'slider', axis: best.d.toArray(), range: [0, depth], confidence: +(inside > 0.5 ? 0.8 : 0.6).toFixed(2),
+      J[p.id] = { type: 'slider', axis: best.d.toArray(), range: [back ? -back : 0, depth], confidence: +(inside > 0.5 ? 0.8 : 0.6).toFixed(2),
         reason: inside > 0.5 ? `box in cavity of ${mate.id}, open toward ${dirName(best)}; other directions blocked` : `bounded travel ${depth} mm along ${dirName(best)}`,
-        note: `${pretty(p.id)}: slides ${depth} mm ${inside > 0.5 ? 'out' : ''} along ${dirName(best)}`.replace('  ', ' ') };
+        note: `${pretty(p.id)}: ${best.stop ? "pushes" : "slides"} ${depth} mm ${inside > 0.5 && !best.stop ? "out" : ""} along ${dirName(best)}${best.stop ? " (stops at first contact with another part)" : ""}${back ? ` (pushes ${back} mm in)` : ''}`.replace('  ', ' ') };
     }
     if (!J[p.id]) J[p.id] = hinge || { type: 'fixed', confidence: 0.5, reason: mate ? `flat-face / fitted contact with ${mate.id}, no free motion` : 'no contacts' };
     await tick(P.length * 2 + ++k2, P.length * 3, `joints ${p.id}`);
@@ -322,6 +450,6 @@ export async function autoAssemble(parts, opts = {}) {
     guesses.push({ part: p.id, matedTo: p.matedTo, poseConfidence: p.conf ?? 0, joint: j.parent ? 'fixed(parent ' + j.parent + ')' : j.type, jointConfidence: j.confidence, reason: reasons[p.id] + ' | ' + j.reason, note: j.note || note });
   }
   const cp = checkPose(P, W, { tolerance: 0 });
-  return { poses, joints, guesses, mode: inPlace ? 'in-place' : 'search', base: base.id, collisions: cp.collisions.map(({ a, b }) => ({ a, b })), timeMs: Date.now() - t0 };
+  return { poses, joints, guesses, mode: inPlace ? 'in-place' : keep.kept.length > 1 ? 'mixed' : 'search', kept: keep.kept.map((p) => p.id), pass1: { frame, rejected: why }, base: base.id, collisions: cp.collisions.map(({ a, b }) => ({ a, b })), timeMs: Date.now() - t0 };
 }
 
