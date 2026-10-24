@@ -131,8 +131,8 @@ export function mount(root) {
       const unit = j.type === 'hinge' ? '°' : 'mm';
       const c = el(`<div class="card">
         <div class="row">Part <select data-k="part">${S.parts.map(p => `<option value="${p.id}" ${p.id === j.part ? 'selected' : ''}>${p.name}</option>`).join('')}</select><button class="sec" data-k="rm">✕</button></div>
-        <div class="row">Type <select data-k="type"><option value="slider">Slides (like a drawer)</option><option value="hinge">Swings (like a hinge)</option><option value="fixed">Doesn't move</option></select></div>
-        ${j.type === 'fixed' ? (j.offset ? '<div class="hint">Placement offset from preset.</div>' : '') : `<div class="row">${j.type === 'hinge' ? 'Turns around' : 'Direction'} <select data-k="ax">${Object.keys(AX).map(k => `<option>${k}</option>`).join('')}<option>custom</option></select>
+        <div class="row">Type <select data-k="type"><option value="slider">Slides (like a drawer)</option><option value="hinge">Swings (like a hinge)</option><option value="fixed">Doesn't move</option>${j.type === 'path' ? '<option value="path">Follows a path (slide + tilt)</option>' : ''}</select></div>
+        ${j.type === 'path' ? '<div class="hint">Slides out, then tilts. The path was worked out by Auto-assemble.</div>' : j.type === 'fixed' ? (j.offset ? '<div class="hint">Placement offset from preset.</div>' : '') : `<div class="row">${j.type === 'hinge' ? 'Turns around' : 'Direction'} <select data-k="ax">${Object.keys(AX).map(k => `<option>${k}</option>`).join('')}<option>custom</option></select>
           <span data-k="cust">${[0, 1, 2].map(i => `<input type="number" step="0.1" data-ax="${i}" value="${j.axis[i]}">`).join('')}</span></div>
         ${j.type === 'hinge' ? `<div class="row">Hinge pin at (mm) ${[0, 1, 2].map(i => `<input type="number" step="0.5" data-o="${i}" value="${(j.origin || [0, 0, 0])[i]}">`).join('')}</div>` : ''}
         <div class="row">From <input type="number" data-r="0" value="${j.range[0]}"> to <input type="number" data-r="1" value="${j.range[1]}"> ${unit}</div>`}
@@ -173,7 +173,7 @@ export function mount(root) {
   }
   function motionLabel(t) {
     const js = movingJoints(); if (!js.length) return `${Math.round(t * 100)}%`;
-    return `${Math.round(t * 100)}% · ` + js.map(j => j.type === 'fixed' ? '' : `${jv(j, t).toFixed(1)}${j.type === 'hinge' ? '°' : ' mm'}`).filter(Boolean).join(', ');
+    return `${Math.round(t * 100)}% · ` + js.map(j => j.type === 'fixed' || j.type === 'path' ? '' : `${jv(j, t).toFixed(1)}${j.type === 'hinge' ? '°' : ' mm'}`).filter(Boolean).join(', ');
   }
   function setT(t) { S.t = t; q('[data-s=slider]').value = Math.round(t * 1000); update(); }
   const markerGeo = new THREE.SphereGeometry(1, 12, 8);
