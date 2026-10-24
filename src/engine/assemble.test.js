@@ -134,5 +134,15 @@ for (const v of ['v1', 'v2', 'v3']) {
   const line = `${v} plate    layout=${res.layout} mode=${res.mode.padEnd(6)} poses ${ok}/${parts.length}  joints ${jok}/${parts.length}  ${Date.now() - t0} ms  collisions:${res.collisions.length}`;
   console.log(line + '\n' + rows.join('\n')); plateSummary.push(line);
   if (res.layout !== 'plate' || !isPlateLayout(parts)) { console.log('  ✘ print-plate layout not detected'); plateFail++; }
+  // orientation: the base must end up rotated like the preset's housing (back +Y, drawer out −Y, Z up), lowest point on z=0
+  { const rot = (M) => new THREE.Matrix4().extractRotation(M), Ro = rot(W[res.base].clone().multiply(baseP.Mp)), Rt = rot(truth[slotsOf(baseP.file)[0]] || new THREE.Matrix4());
+    const D = Ro.clone().multiply(Rt.clone().transpose()).elements, ang = Math.acos(Math.min(1, Math.max(-1, (D[0] + D[5] + D[10] - 1) / 2))) * 180 / Math.PI;
+    let minZ = Infinity; for (const p of parts) minZ = Math.min(minZ, p.geometry.boundingBox.clone().applyMatrix4(W[p.id]).min.z);
+    const dj = res.joints.find((j) => j.part !== res.base && (j.type === 'path' || (j.type === 'slider' && res.roles[j.part] === 'drawer')));
+    const out = dj && (dj.type === 'path' ? new THREE.Vector3(...dj.keyframes[1].value.pos).normalize() : new THREE.Vector3(...dj.axis).multiplyScalar(Math.sign(Math.abs(dj.range[1]) >= Math.abs(dj.range[0]) ? dj.range[1] : dj.range[0])));
+    const okO = ang < 5 && Math.abs(minZ) < 0.5 && out && out.y < -0.9;
+    console.log(`  ${okO ? '✔' : '✘'} orientation vs preset ${ang.toFixed(1)}°, min z ${minZ.toFixed(2)}, drawer out ${out?.toArray().map((x) => x.toFixed(2))}  (${res.orient?.reason})`);
+    if (!okO) { plateFail++; plateSummary.push(`${v} plate orientation ✘ ${ang.toFixed(1)}°`); } }
 }
-console.log('\nPLATE SUMMARY\n' + plateSummary.join('\n') + (plateFail ? `\n${plateFail} plate layout(s) not detected` : ''));
+console.log('\nPLATE SUMMARY\n' + plateSummary.join('\n') + (plateFail ? `\n${plateFail} plate check(s) failed` : ''));
+if (plateFail) process.exitCode = 1;

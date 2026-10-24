@@ -400,7 +400,7 @@ export async function autoAssemble(parts, opts = {}) {
   for (let i = 0; i < P.length; i++) { P[i].G = buildGrid(P[i].geometry); await tick(i + 1, P.length * 3, `analysed ${P[i].id}`); }
   const byVol = [...P].sort((a, b) => b.G.volume - a.G.volume);
   const base = P.find((p) => p.id === opts.base) || byVol[0];
-  const baseW = base.given.clone(), baseInv = baseW.clone().invert();
+  let baseW = base.given.clone(); const baseInv = baseW.clone().invert();
 
   // pass 1: keep every part that already sits plausibly in the assembly (shared CAD coordinates), per part.
   // Tried with opts.poses and with raw STL coordinates (identity); the variant keeping more parts wins.
@@ -599,7 +599,42 @@ export async function autoAssemble(parts, opts = {}) {
     }
   }
 
-  // ---- output (world frame = base's given pose) ----
+  // ---- upright orientation (plate layouts, or opts.orient): one global rotation so the result faces forward like the
+  // presets: backplate / back at +Y, drawer pulls out toward −Y (viewer), Z up (SKADIS hooks at the top), lowest point on z=0.
+  let orient = null;
+  if ((plate && opts.orient !== false) || opts.orient === true) {
+    const snap = (v, not) => { let b = null; for (let a = 0; a < 3; a++) for (const s of [1, -1]) { const d = V(); d.setComponent(a, s); if (not && Math.abs(d.dot(not)) > 0.5) continue; if (!b || d.dot(v) > b.dot(v)) b = d; } return b; };
+    const ctr = (q) => worldBox(q).getCenter(V()), bc = ctr(base), bsz0 = worldBox(base).getSize(V()).toArray().sort((a, b) => b - a);
+    const bp = P.find((q) => q !== base && !q.unmatched && J[q.id].type === 'fixed' && !J[q.id].parent && (() => { const z = worldBox(q).getSize(V()).toArray().sort((a, b) => b - a); return z[2] < 0.25 * z[1] && z[0] * z[1] > 0.4 * bsz0[0] * bsz0[1]; })());
+    const dr = P.find((q) => J[q.id].type === 'path' || (J[q.id].type === 'slider' && !rodOf(q.G)));
+    let fwd = null, back = null, up = null, why2 = [];
+    if (dr) { const j = J[dr.id];
+      if (j.type === 'path') fwd = V(...j.keyframes[1].value.pos);
+      else { const r = j.range, t = Math.abs(r[1]) >= Math.abs(r[0]) ? r[1] : r[0]; fwd = V(...j.axis).multiplyScalar(Math.sign(t) || 1); }
+      if (fwd.lengthSq() < 1e-9) fwd = null; }
+    if (fwd) { back = fwd.clone().negate(); why2.push(`back = opposite of ${dr.id} pull-out`); }
+    else if (bp) { back = ctr(bp).sub(bc); why2.push(`back = ${bp.id}`); }
+    if (back && back.lengthSq() > 1e-6) {
+      back = snap(back);
+      const bt = !up && P.find((q) => J[q.id].type === 'slider' && rodOf(q.G));
+      if (bt) { const u = ctr(bt).sub(bc); u.addScaledVector(back, -u.dot(back)); if (u.length() > 1) { up = snap(u, back); why2.push(`up = ${bt.id} on top`); } }
+      if (!up && bp) { // SKADIS hooks: the rear-most vertices of the backplate sit near its top edge
+        const a = bp.geometry.attributes.position, v = V(), pts = []; let mx = -Infinity, mn = Infinity;
+        for (let i = 0; i < a.count; i++) { v.fromBufferAttribute(a, i).applyMatrix4(bp.M); const d = v.dot(back); pts.push([d, v.clone()]); mx = Math.max(mx, d); mn = Math.min(mn, d); }
+        const m = V(); let n = 0; for (const [d, q] of pts) if (d >= mx - 0.25 * (mx - mn)) { m.add(q); n++; }
+        const u = m.divideScalar(n).sub(ctr(bp)); u.addScaledVector(back, -u.dot(back));
+        if (u.length() > 0.1 * worldBox(bp).getSize(V()).length()) { up = snap(u, back); why2.push('up = backplate hooks'); } }
+      if (!up) { up = snap(V(0, 0, 1), back); why2.push('up = nearest to given +Z'); }
+      const x = V().crossVectors(back, up);
+      const Gm = new THREE.Matrix4().makeBasis(x, back, up).transpose();
+      const bb = new THREE.Box3(); for (const q of P) if (!q.unmatched) bb.union(worldBox(q).applyMatrix4(Gm));
+      const c0 = worldBox(base).applyMatrix4(baseW).getCenter(V()), c1 = worldBox(base).applyMatrix4(Gm).getCenter(V());
+      baseW = new THREE.Matrix4().makeTranslation(c0.x - c1.x, c0.y - c1.y, -bb.min.z).multiply(Gm);
+      orient = { rotation: Gm.toArray(), reason: why2.join(', ') };
+    }
+  }
+
+  // ---- output (world frame = base's given pose, or the upright frame above) ----
   const W = Object.fromEntries(P.map((p) => [p.id, baseW.clone().multiply(p.M)]));
   const R3 = new THREE.Matrix4().extractRotation(baseW);
   const poses = [], joints = [], guesses = [];
@@ -630,6 +665,6 @@ export async function autoAssemble(parts, opts = {}) {
     guesses.push({ part: p.id, role: roles[p.id], matedTo: p.matedTo, poseConfidence: p.conf ?? 0, joint: j.parent ? 'fixed(parent ' + j.parent + ')' : j.type, jointConfidence: j.confidence, reason: reasons[p.id] + ' | ' + j.reason, note: j.note || note });
   }
   const cp = checkPose(P, W, { tolerance: 0 });
-  return { poses, joints, guesses, roles, layout: plate ? 'plate' : 'assembly', mode: inPlace ? 'in-place' : keep.kept.length > 1 ? 'mixed' : 'search', kept: keep.kept.map((p) => p.id), pass1: { frame, rejected: why }, base: base.id, collisions: cp.collisions.map(({ a, b }) => ({ a, b })), timeMs: Date.now() - t0 };
+  return { poses, joints, guesses, roles, layout: plate ? 'plate' : 'assembly', orient, mode: inPlace ? 'in-place' : keep.kept.length > 1 ? 'mixed' : 'search', kept: keep.kept.map((p) => p.id), pass1: { frame, rejected: why }, base: base.id, collisions: cp.collisions.map(({ a, b }) => ({ a, b })), timeMs: Date.now() - t0 };
 }
 

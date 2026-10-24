@@ -114,3 +114,11 @@ Each `poses[i]` and `guesses[i]` has `role`, and the result has `roles: {id: rol
 ## Models
 
 The objects in `public/models/v{1,2,3}_print_layout.3mf` carry their real part names (housing, drawer, lever, button, backplate, pin_drawer_1..4, pin_pivot). Only the names changed; geometry and placement are identical.
+
+## Upright orientation (plate layouts)
+
+For print-plate inputs (`result.layout === 'plate'`; force it with `opts.orient: true`, or turn it off with `opts.orient: false`), one global rotation is applied to every pose and joint (axes, origins, keyframe offsets). The result faces forward like the presets: back at +Y, the drawer pulls out toward −Y, and +Z is up. The lowest point sits on z=0, and the base's XY centre is kept.
+- Back: the opposite of the drawer's pull-out direction (slider or path); if there is no drawer, the backplate's side.
+- Up: the push button's side; otherwise the SKADIS hooks (the rear-most backplate vertices sit near its top edge); otherwise the axis nearest the given +Z.
+
+`result.orient = { rotation: [16 numbers], reason }`, or `null` when not applied. Assembled (non-plate) inputs are left as given.
