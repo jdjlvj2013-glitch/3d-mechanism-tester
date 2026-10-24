@@ -272,10 +272,24 @@ function travel(P, all, dirV, maxT, skip) {
   }
   return t;
 }
-function swing(P, all, axis, origin, sign, skip) {
+// rigid group (part + its fasteners) motion: max travel / swing until any member overlaps a non-member
+function groupHit(G, T, all, skip, tol = 0.01) { return G.some((m) => { if (m._of0 === undefined) m._of0 = score(m, m.M, all, skip).of; return score(m, T.clone().multiply(m.M), all, skip).of > m._of0 + tol; }); }
+function groupTravel(G, all, d, maxT, skip, step = 1, T0 = new THREE.Matrix4()) {
+  let t = 0; while (t + step <= maxT && !groupHit(G, new THREE.Matrix4().makeTranslation(d.x * (t + step), d.y * (t + step), d.z * (t + step)).multiply(T0), all, skip)) t += step; return t;
+}
+function groupSwing(G, all, axis, o, sign, skip, T0, maxA = 60, step = 2, pa = 0) {
+  // pins in curved grooves: at each step allow the group to shift up to 1.5 mm perpendicular to the pin axis to stay clear
+  let a = 0, sh = V(); const rot = (x, d) => new THREE.Matrix4().makeTranslation(d.x, d.y, d.z).multiply(new THREE.Matrix4().makeTranslation(o.x, o.y, o.z)).multiply(new THREE.Matrix4().makeRotationAxis(axis, THREE.MathUtils.degToRad(sign * x))).multiply(new THREE.Matrix4().makeTranslation(-o.x, -o.y, -o.z)).multiply(T0);
+  const [b, c] = [0, 1, 2].filter((q) => q !== pa), offs = [[0, 0]]; for (const r of [0.5, 1, 1.5]) for (const [u, v] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]]) offs.push([u * r, v * r]);
+  while (a + step <= maxA) { let ok = null;
+    for (const [u, v] of offs) { const d = sh.clone(); d.setComponent(b, d.getComponent(b) + u); d.setComponent(c, d.getComponent(c) + v); if (!groupHit(G, rot(a + step, d), all, skip)) { ok = d; break; } }
+    if (!ok) break; sh = ok; a += step; }
+  return { a, sh };
+}
+function swing(P, all, axis, origin, sign, skip, step = 2) {
   let ang = 0;
   while (ang < 90) {
-    const a = ang + 2, R = new THREE.Matrix4().makeRotationAxis(axis, THREE.MathUtils.degToRad(sign * a));
+    const a = ang + step, R = new THREE.Matrix4().makeRotationAxis(axis, THREE.MathUtils.degToRad(sign * a));
     const M = new THREE.Matrix4().makeTranslation(origin.x, origin.y, origin.z).multiply(R).multiply(new THREE.Matrix4().makeTranslation(-origin.x, -origin.y, -origin.z)).multiply(P.M);
     if (score(P, M, all, skip).of > 0.01) break; ang = a;
   }
@@ -468,7 +482,7 @@ export async function autoAssemble(parts, opts = {}) {
   // joint inference
   const J = {};
   const childrenOf = (p) => new Set(P.filter((q) => q.matedTo === p.id && q.G.volume < p.G.volume).map((q) => q.id));
-  let k2 = 0;
+  let k2 = 0; const pinParent = {};
   for (const p of P) {
     if (p !== base && p.matedTo && (pinAxis(p) || (p.G.volume < 0.01 * base.G.volume && Math.max(...worldBox(p).getSize(V()).toArray()) < 12))) { J[p.id] = { type: 'fixed', confidence: 0.5, reason: `pin/fastener-sized part seated in ${p.matedTo}` }; continue; }
     if (p === base || p.unmatched) { J[p.id] = { type: 'fixed', confidence: p === base ? 1 : 0, reason: p === base ? 'base' : 'unmatched' }; continue; }
@@ -487,6 +501,14 @@ export async function autoAssemble(parts, opts = {}) {
     { const opp = trav.find((x) => x.a === best.a && x.s !== best.s);
       if (best.t >= best.ext * 1.2 && opp && opp.t >= 2 && opp.t < opp.ext) { const onlyMate = mate ? travel(p, P, opp.d, opp.ext * 1.2 + 2, new Set(P.filter((q) => q !== mate).map((q) => q.id))) : opp.t;
         if (inside > 0.5 && onlyMate <= opp.t + 1) back = +opp.t.toFixed(1); else { best = opp; best.stop = onlyMate > opp.t + 1; } } }
+    // push button / rod sticking out of the housing: it moves INTO the housing (toward the base centre), and its range is the
+    // travel until it hits the housing itself (parts it drives, e.g. a lever, move out of the way), capped for small parts
+    let push = null;
+    const out0 = trav[0];
+    if (rodOf(p.G) && out0.t >= out0.ext * 1.2) { const c = worldBox(base).getCenter(V()).sub(wb.getCenter(V()));
+      const inn = trav.find((x) => x.a === out0.a && x.s !== out0.s);
+      if (inn && inn.d.dot(c) > 0) { const t = travel(p, P, inn.d, inn.ext * 1.2 + 2, new Set(P.filter((q) => q !== base).map((q) => q.id)));
+        const cap = Math.min(5, 0.25 * inn.ext); /* button-sized travel */ if (t >= 1) push = { d: inn, t: +Math.min(t, cap).toFixed(1), blocked: +inn.t.toFixed(1) }; } }
     const perp = trav.filter((x) => x.a !== best.a);
     const escapes = best.t >= best.ext * 1.2;
     // hinge (checked first) about a pin passing through this part
@@ -501,15 +523,62 @@ export async function autoAssemble(parts, opts = {}) {
         const rods = P.filter((r2) => r2 !== p && r2 !== base && rodOf(r2.G)).map((r2) => r2.id);
         if (rods.length) { const sk2 = new Set([...sk, ...rods]); plus = swing(p, P, axis, pa.center, 1, sk2); minus = swing(p, P, axis, pa.center, -1, sk2); drv = ` (driven by ${rods.join('/')})`; }
       }
+      // driven by a push rod (button): press the rod to its stop and find the smallest swing (either way) that clears it,
+      // without hitting the base -> that is the lever's travel to its first contact and the direction the rod drives it
+      let drivenBy = null;
+      for (const r2 of P) { if (r2 === p || r2 === base || r2 === q || !rodOf(r2.G)) continue; const s2 = score(r2, r2.M, [p]); if (!worldBox(r2).expandByScalar(1).intersectsBox(wb)) continue;
+        const rb = worldBox(r2), c = worldBox(base).getCenter(V()).sub(rb.getCenter(V())), sz = rb.getSize(V()).toArray(), ra = sz.indexOf(Math.max(...sz));
+        const d = V(); d.setComponent(ra, Math.sign(c.getComponent(ra)) || 1); const ext = sz[ra];
+        const t = Math.min(travel(r2, P, d, ext * 1.2 + 2, new Set(P.filter((o) => o !== base).map((o) => o.id))), 5, 0.25 * ext); if (t < 1) continue;
+        const save = r2.M.clone(); r2.M = new THREE.Matrix4().makeTranslation(d.x * t, d.y * t, d.z * t).multiply(save);
+        const onlyBaseRod = new Set(P.filter((o) => o !== base && o !== r2).map((o) => o.id)), clear = (sg) => { for (let a = 0.5; a <= 45; a += 0.5) {
+          const R = new THREE.Matrix4().makeRotationAxis(axis, THREE.MathUtils.degToRad(sg * a)), o = pa.center;
+          const M = new THREE.Matrix4().makeTranslation(o.x, o.y, o.z).multiply(R).multiply(new THREE.Matrix4().makeTranslation(-o.x, -o.y, -o.z)).multiply(p.M);
+          const sc2 = score(p, M, P, onlyBaseRod); if (sc2.of <= 0.01) return a; if ((sc2.perOther[base.id]?.o || 0) > 0 && a > 4) return null; } return null; };
+        const ap = clear(1), am = clear(-1); r2.M = save;
+        const cands = [[1, ap], [-1, am]].filter((x) => x[1] != null).sort((x, y) => x[1] - y[1]);
+        if (cands.length) { drivenBy = { r: r2, sg: cands[0][0], a: cands[0][1], t: +t.toFixed(1) }; break; } }
+      // a lever that kicks a part with a slot path: it swings until it meets that part at the end of its slide (coupled stop)
+      if (drivenBy) { const kicked = P.filter((o) => J[o.id]?.type === 'path');
+        if (kicked.length) { const saved = [];
+          for (const o of kicked) { const pos = J[o.id].keyframes[1].value.pos, T = new THREE.Matrix4().makeTranslation(...pos);
+            for (const m of [o, ...Object.keys(pinParent).filter((id) => pinParent[id] === o.id).map((id) => P.find((x) => x.id === id))]) { saved.push([m, m.M.clone()]); m.M = T.clone().multiply(m.M); } }
+          const keep = new Set([base.id, ...saved.map(([m]) => m.id)]), a2 = swing(p, P, axis, pa.center, drivenBy.sg, new Set(P.filter((o) => !keep.has(o.id)).map((o) => o.id)), 0.5);
+          for (const [m, M] of saved) m.M = M;
+          if (a2 > drivenBy.a) { drivenBy.a = a2; drivenBy.kick = kicked.map((o) => o.id).join('/'); } } }
+      if (drivenBy) { if (drivenBy.sg > 0) plus = drivenBy.a; else minus = drivenBy.a; drv = ` (driven by ${drivenBy.r.id}, pressed ${drivenBy.t} mm; swings ${drivenBy.a}°${drivenBy.kick ? ` until it meets ${drivenBy.kick} at the end of its slide` : ' to clear it'})`; }
       const m = Math.max(plus, minus); if (m < 6 && !(wb.containsPoint(pa.center) && m > 0)) continue;
-      const sgn = plus >= minus ? 1 : -1;
-      hinge = { type: 'hinge', axis: axis.toArray(), origin: pa.center.toArray().map((v) => +v.toFixed(2)), range: [0, sgn * m], confidence: 0.6,
+      const sgn = drivenBy ? drivenBy.sg : plus >= minus ? 1 : -1, m2 = drivenBy ? drivenBy.a : m;
+      hinge = { type: 'hinge', axis: axis.toArray(), origin: pa.center.toArray().map((v) => +v.toFixed(2)), range: [0, sgn * m2], confidence: 0.6,
         reason: `pin-in-hole: ${q.id} (axis ${AX[pa.a]}) passes through; free swing ${plus}° / −${minus}°${drv}`,
-        note: `${pretty(p.id)}: swings ${m}° about ${q.id} (${AX[pa.a]} axis)` };
+        note: `${pretty(p.id)}: swings ${m2}° about ${q.id} (${AX[pa.a]} axis)` };
       break;
     }
     J[p.id] = null;
-    if (!hinge && best.t >= 2 && perp.every((x) => x.t < 0.5 * best.t || (x.t < best.ext * 1.2 && x.t <= 6)) && (inside > 0.5 || !escapes)) {
+    if (!hinge && push) J[p.id] = { type: 'slider', axis: push.d.d.toArray(), range: [0, push.t], confidence: 0.7,
+      reason: `push rod: escapes ${dirName(out0)} (out of the housing), so it is pressed ${dirName(push.d)} into ${base.id}; stops after ${push.t} mm against ${base.id}${push.blocked < push.t ? ` (drives the part it touches after ${push.blocked} mm)` : ''}`,
+      note: `${pretty(p.id)}: pushes ${push.t} mm in along ${dirName(push.d)}` };
+    // part hanging on ≥ 2 pins of its own (pins inside its bbox, along one axis): try the slot path the pins allow, i.e.
+    // slide out until the pins stop in their grooves, then tilt about the pin that stays put (e.g. v3 tilt-out drawer)
+    if (!J[p.id] && !hinge && !rodOf(p.G)) {
+      const pins = P.filter((q) => q !== p && q !== base && Math.max(...worldBox(q).getSize(V()).toArray()) < 25 && q.G.volume < 0.05 * p.G.volume && wb.clone().expandByScalar(2).containsPoint(worldBox(q).getCenter(V())) && score(q, q.M, [p]).perOther[p.id]?.c > 0);
+      // pin axis: the axis along which every pin sits at one of the part's side faces
+      const side = (a) => pins.reduce((m, q) => { const c = worldBox(q).getCenter(V()).getComponent(a); return Math.max(m, Math.min(Math.abs(c - wb.min.getComponent(a)), Math.abs(c - wb.max.getComponent(a)))); }, 0);
+      const pa = pins.length >= 1 ? [0, 1, 2].sort((a, b) => side(a) - side(b))[0] : -1;
+      if (pa >= 0 && side(pa) < 8) {
+        const G = [p, ...pins], gs = new Set(G.map((q) => q.id)), sk2 = new Set(P.filter((q) => q !== base && J[q.id]?.type !== 'fixed').map((q) => q.id).concat([...gs])), pc = (q) => worldBox(q).getCenter(V()); let path = null;
+        for (const x of trav) { if (x.a === pa) continue;
+          const t1 = groupTravel(G, P, x.d, Math.min(30, x.ext * 0.5), gs, 0.5); if (t1 < 2) continue;
+          const T1 = new THREE.Matrix4().makeTranslation(x.d.x * t1, x.d.y * t1, x.d.z * t1), ax = V(); ax.setComponent(pa, 1);
+          for (const q of pins) { const o = pc(q).add(x.d.clone().multiplyScalar(t1));
+            for (const sg of [1, -1]) { const sw = groupSwing(G, P, ax, o, sg, sk2, T1, 60, 2, pa), a = sw.a; if (a >= 10 && (!path || a > path.a || (a === path.a && sw.sh.length() < path.sh.length()))) path = { x, t1, q, o: pc(q), sg, a, ax, sh: sw.sh }; } } }
+        if (path) { const { x, t1, q, o, sg, a, ax, sh } = path, pos = x.d.clone().multiplyScalar(t1).toArray().map((v) => +v.toFixed(2)), pos2 = x.d.clone().multiplyScalar(t1).add(sh).toArray().map((v) => +v.toFixed(2));
+          J[p.id] = { type: 'path', axis: ax.toArray(), origin: o.toArray().map((v) => +v.toFixed(2)), range: [0, 1], confidence: 0.55,
+            keyframes: [{ t: 0, value: { pos: [0, 0, 0], angle: 0 } }, { t: 0.3, value: { pos, angle: 0 } }, { t: 1, value: { pos: pos2, angle: sg * a } }],
+            reason: `hangs on ${pins.length} pins (${pins.map((r) => r.id).join(', ')}) in grooves of ${base.id}: slides ${t1} mm ${dirName(x)} until the pins stop, then tilts ${a}° about ${q.id}`,
+            note: `${pretty(p.id)}: slides ${t1} mm ${dirName(x)}, then tilts ${a}° about its ${q.id} pin` };
+          for (const r of pins) pinParent[r.id] = p.id; } } }
+    if (!J[p.id] && !hinge && best.t >= 2 && perp.every((x) => x.t < 0.5 * best.t || (x.t < best.ext * 1.2 && x.t <= 6)) && (inside > 0.5 || !escapes)) {
       let depth = best.t;
       if (escapes && mate) { const i = wb.clone().intersect(worldBox(mate)); depth = i.getSize(V()).getComponent(best.a); }
       depth = +Math.min(depth, best.t).toFixed(1);
@@ -521,6 +590,7 @@ export async function autoAssemble(parts, opts = {}) {
     await tick(P.length * 2 + ++k2, P.length * 3, `joints ${p.id}`);
   }
   // small parts riding on a moving part -> parent it
+  for (const [id, par] of Object.entries(pinParent)) J[id] = { type: 'fixed', parent: par, confidence: 0.6, reason: `pin of ${par}, rides in its groove`, note: `${pretty(id)}: moves with ${par}` };
   for (const p of P) {
     if (J[p.id].type !== 'fixed' || p === base || !p.matedTo) continue;
     const m = P.find((q) => q.id === p.matedTo);
@@ -533,19 +603,33 @@ export async function autoAssemble(parts, opts = {}) {
   const W = Object.fromEntries(P.map((p) => [p.id, baseW.clone().multiply(p.M)]));
   const R3 = new THREE.Matrix4().extractRotation(baseW);
   const poses = [], joints = [], guesses = [];
+  // role per part, from joint type + geometry (for UI labels / colours)
+  const bsz = worldBox(base).getSize(V()).toArray().sort((a, b) => b - a);
+  const roleOf = (p) => { const j = J[p.id], sz = worldBox(p).getSize(V()).toArray().sort((a, b) => b - a);
+    if (p === base) return 'base';
+    if (p.unmatched) return 'part';
+    if (j.type === 'path') return 'drawer';
+    if (j.type === 'slider') return rodOf(p.G) ? 'button' : 'drawer';
+    if (j.type === 'hinge') return 'lever';
+    if (pinParent[p.id] || pinAxis(p) || (sz[0] < 25 && p.G.volume < 0.01 * base.G.volume)) return 'pin';
+    if (sz[2] < 0.25 * sz[1] && sz[0] * sz[1] > 0.4 * bsz[0] * bsz[1]) return 'backplate';
+    return 'part'; };
+  const roles = Object.fromEntries(P.map((p) => [p.id, roleOf(p)]));
   for (const p of P) {
     const j = J[p.id], w = W[p.id];
     const note = j.note || (p === base ? `${pretty(p.id)}: base, stays put` : p.unmatched ? `${pretty(p.id)}: could not place (left as is)` : `${pretty(p.id)}: fixed to ${p.matedTo || 'nothing'}`);
-    poses.push({ id: p.id, matrix: w.toArray(), confidence: p.conf ?? 0, reason: reasons[p.id], note });
+    poses.push({ id: p.id, role: roles[p.id], matrix: w.toArray(), confidence: p.conf ?? 0, reason: reasons[p.id], note });
     const offset = j.parent ? W[j.parent].clone().invert().multiply(w) : w;
     joints.push({ part: p.id, type: 'fixed', offset: offset.toArray(), ...(j.parent ? { parent: j.parent } : {}), confidence: p.conf ?? 0, reason: reasons[p.id], note: j.parent ? j.note : note });
     let mj = null;
     if (j.type === 'slider') mj = { part: p.id, type: 'slider', axis: V(...j.axis).transformDirection(R3).toArray().map((v) => +v.toFixed(6)), range: j.range };
+    if (j.type === 'path') mj = { part: p.id, type: 'path', axis: V(...j.axis).transformDirection(R3).toArray().map((v) => +v.toFixed(6)), origin: V(...j.origin).applyMatrix4(baseW).toArray(), range: j.range,
+      keyframes: j.keyframes.map((k) => ({ t: k.t, value: { pos: V(...k.value.pos).transformDirection(R3).multiplyScalar(V(...k.value.pos).length()).toArray().map((v) => +v.toFixed(3)), angle: k.value.angle } })) };
     if (j.type === 'hinge') mj = { part: p.id, type: 'hinge', axis: V(...j.axis).transformDirection(R3).toArray().map((v) => +v.toFixed(6)), origin: V(...j.origin).applyMatrix4(baseW).toArray(), range: j.range };
     if (mj) joints.push({ ...mj, confidence: j.confidence, reason: j.reason, note: j.note });
-    guesses.push({ part: p.id, matedTo: p.matedTo, poseConfidence: p.conf ?? 0, joint: j.parent ? 'fixed(parent ' + j.parent + ')' : j.type, jointConfidence: j.confidence, reason: reasons[p.id] + ' | ' + j.reason, note: j.note || note });
+    guesses.push({ part: p.id, role: roles[p.id], matedTo: p.matedTo, poseConfidence: p.conf ?? 0, joint: j.parent ? 'fixed(parent ' + j.parent + ')' : j.type, jointConfidence: j.confidence, reason: reasons[p.id] + ' | ' + j.reason, note: j.note || note });
   }
   const cp = checkPose(P, W, { tolerance: 0 });
-  return { poses, joints, guesses, layout: plate ? 'plate' : 'assembly', mode: inPlace ? 'in-place' : keep.kept.length > 1 ? 'mixed' : 'search', kept: keep.kept.map((p) => p.id), pass1: { frame, rejected: why }, base: base.id, collisions: cp.collisions.map(({ a, b }) => ({ a, b })), timeMs: Date.now() - t0 };
+  return { poses, joints, guesses, roles, layout: plate ? 'plate' : 'assembly', mode: inPlace ? 'in-place' : keep.kept.length > 1 ? 'mixed' : 'search', kept: keep.kept.map((p) => p.id), pass1: { frame, rejected: why }, base: base.id, collisions: cp.collisions.map(({ a, b }) => ({ a, b })), timeMs: Date.now() - t0 };
 }
 

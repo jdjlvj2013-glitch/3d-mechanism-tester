@@ -99,3 +99,18 @@ const r = await autoAssemble(parts, { poses, base, clearance: 0.3, onProgress, s
   - Tilt-out `path` motion is not detected (the v3 drawer comes out `fixed`).
   - Hinge range stops at the first voxel overlap (the v3 lever gets 6° where the design value is −12.8°).
   - Pins are reported as `fixed` with no `parent` when their mate's motion was not inferred.
+
+## Joint inference (autoAssemble)
+
+- **Push rods (buttons)**: a small rod-shaped part whose free-travel direction escapes the base gets a slider in the *push-in* direction (toward the base centre). The range runs to first contact with the base and is capped at `min(5 mm, 0.25 × part extent)`. The reason says "push rod: …".
+- **Driven levers**: a hinge part touched by a push rod is swung while the rod is pressed in. The range is `[0, ±a]`, where `a` is the angle at which the lever first contacts the base or a slid path part (0.5° steps).
+- **Path joints (pins in grooves)**: a part with small pins (max dim < 25 mm, < 5 % of its volume, inside its bbox and in contact) gets a `path` joint. The part slides along a non-pin axis, then tilts ≥ 10° about one pin, with up to 1.5 mm shift perpendicular to the pin axis. Its pins become `fixed` with `parent` = that part.
+  Shape: `{part, type:'path', axis, origin, range:[0,1], keyframes:[{t, value:{pos:[x,y,z], angle}}]}`. The transform is `T(pos+origin)·R(axis,angle)·T(−origin)`, and `solveJoints` interpolates the keyframes.
+
+## Roles
+
+Each `poses[i]` and `guesses[i]` has `role`, and the result has `roles: {id: role}`. The role is one of `'base' | 'drawer' | 'button' | 'lever' | 'pin' | 'backplate' | 'part'` (`'part'` when unsure). It is inferred from the joint type and geometry (base = largest; path or long slider = drawer; push rod = button; hinge = lever; small part fixed to a parent = pin; flat plate = backplate).
+
+## Models
+
+The objects in `public/models/v{1,2,3}_print_layout.3mf` carry their real part names (housing, drawer, lever, button, backplate, pin_drawer_1..4, pin_pivot). Only the names changed; geometry and placement are identical.
