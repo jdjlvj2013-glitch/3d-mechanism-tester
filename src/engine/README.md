@@ -115,6 +115,17 @@ Each `poses[i]` and `guesses[i]` has `role`, and the result has `roles: {id: rol
 
 The objects in `public/models/v{1,2,3}_print_layout.3mf` carry their real part names (housing, drawer, lever, button, backplate, pin_drawer_1..4, pin_pivot). Only the names changed; geometry and placement are identical.
 
+## Hinge linkages (desk-mount four-bar, v4)
+
+When the parts contain ≥ 2 links (long thin bars, length > 4× width, with a round hole near each end through the thin axis), a mount with ≥ 2 coaxial pivot-hole pairs and a carried part with a matching pair, `autoAssemble` switches to an analytic linkage solver (`opts.linkage: false` turns it off):
+
+- Hole axes are refined with a circle fit on the mesh vertices (teardrop tips rejected), so placements are exact rather than voxel-scored.
+- Base = the mount: the pivoted part with screw holes on one face. That face is the desk side ("up"). Pivot A is the one farther from the desk and takes the links with a detent hole; pivot B takes the others.
+- Links sit folded, parallel to the desk face, on the inner face of each lug (clearance + 0.1 mm). The carried part's pivot pairs go at A + L·u and B + L·u, level, with its opening toward the desk. Pins go into the ground pivots (head on the lug's outer face) and then into the coupler pivots (head on the link's outer face).
+- Joints: each link gets a hinge about its mount pivot, swinging from folded to hanging (−up). The carried part and its coupler pins get two hinges, a counter-rotation about the coupler pivot followed by the link swing about the ground pivot (like the v4 preset): a level circular translation. Ground pins are fixed. Roles: `link`, `carrier`, `pin`.
+- Orientation (desk mount): screw face up with its top at z = 0, everything below, links folding toward +Y, carried part swinging down toward −Y.
+- Joints are derived from the poses, so in-place inputs get the same hinges.
+
 ## Upright orientation (plate layouts)
 
 The orientation is always evaluated, deterministically and identically on the main thread and in the worker (turn it off with `opts.orient: false`). For print-plate inputs (`result.layout === 'plate'`), and for assembled inputs that are not upright (or with `opts.orient: true`), one global rotation is applied to every pose and joint (axes, origins, keyframe offsets). The result faces forward like the presets: back at +Y, the drawer pulls out toward −Y, and +Z is up. The lowest point sits on z=0, and the base's XY centre is kept.

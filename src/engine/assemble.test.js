@@ -98,7 +98,7 @@ function load3MF(name, buf) {
     const key = k++ ? `${name}#${k}` : name; let id = key.replace(/\.\w+$/, ''); if (ids.includes(id)) id += '_' + k; ids.push(id); out.push({ id, name: key, geometry: g }); } });
   return out;
 }
-for (const v of ['v1', 'v2', 'v3']) {
+for (const v of ['v1', 'v2', 'v3', 'v4']) {
   const pr = presets.find((p) => p.id === v), truth = solveJoints(pr.joints, 0);
   const b = readFileSync(root + v + '_print_layout.3mf'); const parts = load3MF('print_layout.3mf', b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength));
   const stl = {}; for (const p of pr.parts) stl[p.file] ||= await loadSTL(root + p.file);
@@ -140,8 +140,17 @@ for (const v of ['v1', 'v2', 'v3']) {
     let minZ = Infinity; for (const p of parts) minZ = Math.min(minZ, p.geometry.boundingBox.clone().applyMatrix4(W[p.id]).min.z);
     const dj = res.joints.find((j) => j.part !== res.base && (j.type === 'path' || (j.type === 'slider' && res.roles[j.part] === 'drawer')));
     const out = dj && (dj.type === 'path' ? new THREE.Vector3(...dj.keyframes[1].value.pos).normalize() : new THREE.Vector3(...dj.axis).multiplyScalar(Math.sign(Math.abs(dj.range[1]) >= Math.abs(dj.range[0]) ? dj.range[1] : dj.range[0])));
-    const okO = ang < 5 && Math.abs(minZ) < 0.5 && out && out.y < -0.9;
-    console.log(`  ${okO ? '✔' : '✘'} orientation vs preset ${ang.toFixed(1)}°, min z ${minZ.toFixed(2)}, drawer out ${out?.toArray().map((x) => x.toFixed(2))}  (${res.orient?.reason})`);
+    let okO;
+    if (res.roles[res.base] === 'base' && Object.values(res.roles).includes('link')) {
+      // desk-mount linkage: screw face up at z = 0, everything below, carried part swings down toward the viewer (−Y)
+      let maxZ = -Infinity; for (const p of parts) maxZ = Math.max(maxZ, p.geometry.boundingBox.clone().applyMatrix4(W[p.id]).max.z);
+      const ring = parts.find((p) => res.roles[p.id] === 'carrier'), at = (t) => ring.geometry.boundingBox.clone().applyMatrix4(solveJoints(res.joints, t)[ring.id]).getCenter(new THREE.Vector3());
+      const mv = at(1).sub(at(0)), r0 = ring.geometry.boundingBox.clone().applyMatrix4(W[ring.id]);
+      okO = ang < 5 && Math.abs(maxZ) < 0.5 && r0.max.z < -1 && mv.y < -50 && mv.z < -50;
+      console.log(`  ${okO ? '✔' : '✘'} desk-mount orientation vs preset ${ang.toFixed(1)}°, max z ${maxZ.toFixed(2)}, ${ring.id} top z ${r0.max.z.toFixed(1)}, moves ${mv.toArray().map((x) => x.toFixed(1))} at t=1  (${res.orient?.reason})`);
+    } else {
+    okO = ang < 5 && Math.abs(minZ) < 0.5 && out && out.y < -0.9;
+    console.log(`  ${okO ? '✔' : '✘'} orientation vs preset ${ang.toFixed(1)}°, min z ${minZ.toFixed(2)}, drawer out ${out?.toArray().map((x) => x.toFixed(2))}  (${res.orient?.reason})`); }
     if (!okO) { plateFail++; plateSummary.push(`${v} plate orientation ✘ ${ang.toFixed(1)}°`); } }
 }
 console.log('\nPLATE SUMMARY\n' + plateSummary.join('\n') + (plateFail ? `\n${plateFail} plate check(s) failed` : ''));

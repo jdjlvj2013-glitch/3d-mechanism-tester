@@ -402,6 +402,188 @@ export function isPlateLayout(parts, poses = {}) {
   return true;
 }
 
+// ---------- hinge linkages (four-bar / parallelogram: mount + 2..4 links + carried part + pins) ----------
+// All geometry here is analytic (hole axes refined on the mesh), not voxel-scored: links are long thin bars with a round
+// hole at each end, the mount has ≥ 2 coaxial pivot-hole pairs plus screw holes on its desk face, the carried part (cup
+// ring) has a matching pair of pivot pairs, pins are small round parts with a head.
+const unitAx = (a, s = 1) => { const v = V(); v.setComponent(a, s); return v; };
+const snapAxis = (v) => { let a = 0; for (let k = 1; k < 3; k++) if (Math.abs(v.getComponent(k)) > Math.abs(v.getComponent(a))) a = k; return unitAx(a, Math.sign(v.getComponent(a)) || 1); };
+/** least-squares circle through the mesh vertices on a hole wall (local coords); teardrop tips are rejected by radius. */
+function refineHole(g, h) {
+  const pos = g.attributes.position, [b, c] = [0, 1, 2].filter((q) => q !== h.a), cb = h.center.getComponent(b), cc = h.center.getComponent(c), R0 = h.d / 2 + 1.2;
+  let pts = [];
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getComponent(i, b), y = pos.getComponent(i, c), z = pos.getComponent(i, h.a);
+    if (z < h.lo - 1 || z > h.hi + 1 || Math.hypot(x - cb, y - cc) > R0) continue; pts.push([x, y, z]);
+  }
+  if (pts.length < 6) return { ...h, cb, cc, rad: h.d / 2, alo: h.lo, ahi: h.hi };
+  let cx = cb, cy = cc, rad = h.d / 2;
+  for (let it = 0; it < 4; it++) {
+    let Sx = 0, Sy = 0, Sxx = 0, Syy = 0, Sxy = 0, Sxz = 0, Syz = 0, Sz = 0, n = pts.length;
+    for (const [x0, y0] of pts) { const x = x0 - cb, y = y0 - cc, z = x * x + y * y; Sx += x; Sy += y; Sxx += x * x; Syy += y * y; Sxy += x * y; Sxz += x * z; Syz += y * z; Sz += z; }
+    const A = new THREE.Matrix3().set(Sxx, Sxy, Sx, Sxy, Syy, Sy, Sx, Sy, n), r = V(-Sxz, -Syz, -Sz).applyMatrix3(A.invert());
+    cx = cb - r.x / 2; cy = cc - r.y / 2; rad = Math.sqrt(Math.max(0, r.x * r.x / 4 + r.y * r.y / 4 - r.z));
+    const d = pts.map(([x, y]) => Math.hypot(x - cx, y - cy)), med = [...d].sort((p, q) => p - q)[d.length >> 1];
+    const keep = pts.filter((_, i) => Math.abs(d[i] - med) < 0.3 && d[i] <= med + 0.3); if (keep.length < 6) break; pts = keep;
+  }
+  let alo = Infinity, ahi = -Infinity; for (const p of pts) { alo = Math.min(alo, p[2]); ahi = Math.max(ahi, p[2]); }
+  const center = V(); center.setComponent(b, cx); center.setComponent(c, cy); center.setComponent(h.a, (alo + ahi) / 2);
+  return { a: h.a, d: 2 * rad, rad, center, alo, ahi };
+}
+const roundHoles = (p, dmin = 3.5, dmax = 8) => (p.G.rholes ||= holesOf(p.G).filter((h) => h.d >= dmin && h.d <= dmax).map((h) => refineHole(p.geometry, h)));
+/** coaxial pairs (same axis, same in-plane centre, ≥ 20 mm apart along it) -> [{a, h:[lo, hi], c}] (c = in-plane centre). */
+function pivotPairs(p) {
+  const hs = roundHoles(p), out = [];
+  for (let i = 0; i < hs.length; i++) for (let j = i + 1; j < hs.length; j++) {
+    const x = hs[i], y = hs[j]; if (x.a !== y.a) continue;
+    const d = x.center.clone().sub(y.center); const ax = Math.abs(d.getComponent(x.a)); d.setComponent(x.a, 0);
+    if (d.length() < 1.2 && ax > 20) out.push({ a: x.a, h: x.center.getComponent(x.a) < y.center.getComponent(x.a) ? [x, y] : [y, x], c: x.center.clone().add(y.center).multiplyScalar(0.5) });
+  }
+  return out;
+}
+function linkageInfo(P) {
+  const dims = (p) => p.G.bb.getSize(V()).toArray();
+  const links = [], pins = [];
+  for (const p of P) {
+    const s = dims(p), o = [0, 1, 2].sort((a, b) => s[b] - s[a]);
+    if (s[o[0]] > 40 && s[o[0]] > 4 * s[o[1]] && s[o[2]] < 0.8 * s[o[1]]) {
+      const hs = roundHoles(p, 2, 8).filter((h) => h.a === o[2]), big = hs.filter((h) => h.d >= 3.5);
+      let best = null; for (const x of big) for (const y of big) { const L = x.center.distanceTo(y.center); if (x !== y && L > 0.7 * s[o[0]] && (!best || L > best.L)) best = { x, y, L }; }
+      if (best) { const small = hs.filter((h) => h.d < 3.5 || (h !== best.x && h !== best.y && h.d < 0.7 * best.x.d));
+        // mount end = the end nearer a detent hole (link_a); otherwise the first
+        let [g, f] = [best.x, best.y]; if (small.length && small[0].center.distanceTo(f.center) < small[0].center.distanceTo(g.center)) [g, f] = [f, g];
+        links.push({ p, a: o[2], long: o[0], g, f, L: best.L, t: s[o[2]], detent: small.length > 0 }); continue; }
+    }
+    if (s[o[0]] < 25 && s[o[0]] >= 1.2 * s[o[1]] && Math.abs(s[o[1]] - s[o[2]]) < 0.15 * s[o[1]]) pins.push(p);
+  }
+  if (links.length < 2) return null;
+  const others = P.filter((p) => !links.some((l) => l.p === p) && !pins.includes(p));
+  const cand = others.map((p) => ({ p, pp: pivotPairs(p) })).filter((x) => x.pp.length >= 2);
+  if (cand.length < 2) return null;
+  // mount = the pivoted part with screw holes on one face (fewest perpendicular holes, ≥ 2); carried part = the other
+  const perp = (x) => roundHoles(x.p).filter((h) => h.a !== x.pp[0].a).length;
+  cand.sort((x, y) => { const a = perp(x), b = perp(y); return (a >= 2 ? a : 1e9) - (b >= 2 ? b : 1e9) || y.p.G.volume - x.p.G.volume; });
+  const M = cand[0], R = cand.find((x) => x !== M && x.pp.some((q) => q.a === x.pp[0].a));
+  const ax = M.pp[0].a, piv = M.pp.filter((q) => q.a === ax).slice(0, 2);
+  // desk face: outward normal of the bbox face carrying the screw holes; else the face farthest from the pivots
+  const bb = M.p.G.bb, scr = roundHoles(M.p).filter((h) => h.a !== ax);
+  let up = null;
+  for (const h of scr) { const lo = h.alo - bb.min.getComponent(h.a) < 1.5, hi = bb.max.getComponent(h.a) - h.ahi < 1.5; if (lo !== hi) { up = unitAx(h.a, lo ? -1 : 1); break; } }
+  if (!up) { const pc = piv[0].c.clone().add(piv[1].c).multiplyScalar(0.5); let bd = -1;
+    for (let a = 0; a < 3; a++) if (a !== ax) for (const sg of [1, -1]) { const d = sg > 0 ? bb.max.getComponent(a) - pc.getComponent(a) : pc.getComponent(a) - bb.min.getComponent(a); if (d > bd) { bd = d; up = unitAx(a, sg); } } }
+  // A = pivot farther from the desk (front/lower, carries the detent link), B = the other
+  piv.sort((x, y) => x.c.dot(up) - y.c.dot(up));
+  const [A, B] = piv, e = unitAx(ax), AB = B.c.clone().sub(A.c); AB.setComponent(ax, 0);
+  let u = AB.clone().addScaledVector(up, -AB.dot(up)); u = u.lengthSq() > 1 ? snapAxis(u) : snapAxis(V().crossVectors(up, e));
+  return { mount: M.p, ring: R?.p || null, ringPairs: R?.pp || [], links, pins, ax, e, up, u, A, B,
+    ids: new Set([M.p, R?.p, ...links.map((l) => l.p), ...pins].filter(Boolean).map((p) => p.id)) };
+}
+/** place links (folded, parallel to the desk face, toward the upper pivot), carried part and pins in the mount's frame. */
+function linkagePlace(LK, clr, reasons) {
+  const { e, ax, up, u, A, B, mount } = LK, gap = clr + 0.1, placed = [];
+  mount.M = mount.M || new THREE.Matrix4();
+  const rotFor = (pairs) => ROTATIONS_24.find((R) => pairs.every(([l, w]) => l.clone().applyMatrix4(R).distanceTo(w) < 1e-6));
+  const sideFace = (h, s) => (s < 0 ? h.ahi : h.alo); // lug face toward the mount centre (s = -1 left lug, +1 right lug)
+  const lugIn = { A: [sideFace(A.h[0], -1), sideFace(A.h[1], 1)], B: [sideFace(B.h[0], -1), sideFace(B.h[1], 1)] };
+  const Lavg = LK.links.reduce((s, l) => s + l.L, 0) / LK.links.length;
+  // links: detent links on A, the rest on B, left then right
+  const slots = []; const la = LK.links.filter((l) => l.detent), lb = LK.links.filter((l) => !l.detent);
+  const [qa, qb] = la.length && lb.length ? [la, lb] : [LK.links.slice(0, Math.ceil(LK.links.length / 2)), LK.links.slice(Math.ceil(LK.links.length / 2))];
+  for (const [list, pv, key] of [[qa, A, 'A'], [qb, B, 'B']]) list.slice(0, 2).forEach((l, i) => slots.push({ l, pv, key, side: i ? 1 : -1 }));
+  for (const s of slots) {
+    const { l, pv, side } = s, dl = l.f.center.clone().sub(l.g.center); dl.setComponent(l.a, 0);
+    const R = rotFor([[unitAx(l.a), e], [snapAxis(dl), u]]) || rotFor([[unitAx(l.a, -1), e], [snapAxis(dl), u]]);
+    const inner = lugIn[s.key][side < 0 ? 0 : 1], dir = -side, cAx = inner + dir * (gap + l.t / 2);
+    const g = l.g.center.clone().applyMatrix4(R), lc = l.p.G.bb.getCenter(V()).applyMatrix4(R);
+    const t = pv.c.clone().sub(g); t.setComponent(ax, cAx - lc.getComponent(ax));
+    l.p.M = new THREE.Matrix4().makeTranslation(t.x, t.y, t.z).multiply(R); l.p.conf = 0.8; placed.push(l.p);
+    s.outer = inner + dir * gap - (dir > 0 ? 0 : 0); s.linkOuter = inner + dir * gap; s.linkInner = inner + dir * (gap + l.t);
+    reasons[l.p.id] = `hinge link (${l.L.toFixed(1)} mm between holes${l.detent ? ', detent hole' : ''}) on ${s.key === 'A' ? 'front/lower' : 'rear/upper'} pivot of ${mount.id}, ${side < 0 ? 'left' : 'right'} lug inner face, folded flat`;
+  }
+  // carried part: its two pivot pairs = A + L·u and B + L·u (parallelogram), level, opening toward the desk
+  const ring = LK.ring, Ap = A.c.clone().addScaledVector(u, Lavg), Bp = B.c.clone().addScaledVector(u, Lavg);
+  if (ring) {
+    const rp = LK.ringPairs.filter((q) => q.a === LK.ringPairs[0].a).slice(0, 2), want = B.c.clone().sub(A.c); want.setComponent(ax, 0);
+    const open = ring.G.cavities[0]?.open || [], ctr = ring.G.bb.getCenter(V());
+    let best = null;
+    for (const R of ROTATIONS_24) {
+      if (Math.abs(unitAx(rp[0].a).applyMatrix4(R).dot(e)) < 0.99) continue;
+      for (const [p0, p1] of [[rp[0], rp[1]], [rp[1], rp[0]]]) {
+        const v = p1.c.clone().sub(p0.c).applyMatrix4(R); v.setComponent(ax, 0); const err = v.distanceTo(want); if (err > 3) continue;
+        const up2 = open.some((o) => unitAx(o.a, o.s).applyMatrix4(R).dot(up) > 0.9) ? 0 : 1;
+        const c0 = p0.c.clone().applyMatrix4(R), t = Ap.clone().sub(c0), cR = ctr.clone().applyMatrix4(R);
+        t.setComponent(ax, (A.c.getComponent(ax)) - cR.getComponent(ax) + 0); // centred between the lugs (symmetric)
+        const M = new THREE.Matrix4().makeTranslation(t.x, t.y, t.z).multiply(R), k = up2 * 10 + err;
+        if (!best || k < best.k) best = { M, k, p0 };
+      }
+    }
+    if (best) { ring.M = best.M; ring.conf = 0.8; placed.push(ring);
+      // re-centre on the mount's lug mid-plane (pivot pair mid-points along the axis)
+      const mid = (A.h[0].center.getComponent(ax) + A.h[1].center.getComponent(ax)) / 2, rc = best.p0.c.clone().applyMatrix4(best.M).getComponent(ax);
+      const shift = mid - rc; ring.M.premultiply(new THREE.Matrix4().makeTranslation(...e.clone().multiplyScalar(shift).toArray()));
+      reasons[ring.id] = `carried by the links (parallelogram: its pivot pairs sit ${Lavg.toFixed(1)} mm from the mount pivots), kept level, opening toward the desk face`; }
+  }
+  // pins: ground pivots first (head on the lug's outer face), then coupler pivots (head on the link's outer face)
+  const pinSlots = [];
+  for (const s of slots) pinSlots.push({ c: s.pv.c, side: s.side, outer: s.pv.h[s.side < 0 ? 0 : 1][s.side < 0 ? 'alo' : 'ahi'], kind: 'ground', key: s.key, link: s.l });
+  for (const s of slots) pinSlots.push({ c: s.key === 'A' ? Ap : Bp, side: s.side, outer: s.linkOuter, kind: 'coupler', key: s.key, link: s.l });
+  LK.pins.forEach((p, i) => {
+    const s = pinSlots[i]; if (!s) return;
+    const sz = p.G.bb.getSize(V()).toArray(), k = [0, 1, 2].sort((a, b) => sz[b] - sz[a])[0], { nx, ny, nz, occ } = p.G, dimk = [nx, ny, nz][k];
+    const slab = (from, to) => { let n = 0; for (let z = 0; z < nz; z++) for (let y = 0; y < ny; y++) for (let x = 0; x < nx; x++) { const c = [x, y, z][k]; if (c >= from && c < to && occ[x + nx * (y + ny * z)]) n++; } return n; };
+    const hs = slab(0, Math.ceil(dimk * 0.2)) >= slab(Math.floor(dimk * 0.8), dimk) ? -1 : 1; // head at -k or +k end
+    const outward = unitAx(ax, s.side < 0 ? -1 : 1), R = rotFor([[unitAx(k, hs), outward]]);
+    const ctr = p.G.bb.getCenter(V()).applyMatrix4(R), hb = p.G.bb.clone().applyMatrix4(R), headEnd = s.side < 0 ? hb.min.getComponent(ax) : hb.max.getComponent(ax), headLen = 0;
+    const t = s.c.clone().sub(ctr); t.setComponent(ax, (s.outer + (s.side < 0 ? -1 : 1) * pinHead(p, k)) - headEnd + headLen);
+    p.M = new THREE.Matrix4().makeTranslation(t.x, t.y, t.z).multiply(R); p.conf = 0.8; placed.push(p); s.pin = p;
+    reasons[p.id] = `pin in the ${s.kind === 'ground' ? (s.key === 'A' ? 'front/lower' : 'rear/upper') + ' mount pivot' : 'coupler pivot (' + (s.key === 'A' ? 'front' : 'rear') + ')'} on the ${s.side < 0 ? 'left' : 'right'}, head outside`;
+  });
+  LK.pinSlots = pinSlots; LK.slots = slots; LK.Ap = Ap; LK.Bp = Bp; LK.Lavg = Lavg;
+  return placed;
+}
+/** head thickness of a pin (mm): length of the wide end along its long axis k. */
+function pinHead(p, k) {
+  const { nx, ny, nz, occ, r } = p.G, dims = [nx, ny, nz], sl = [];
+  for (let i = 0; i < dims[k]; i++) sl.push(0);
+  for (let z = 0; z < nz; z++) for (let y = 0; y < ny; y++) for (let x = 0; x < nx; x++) if (occ[x + nx * (y + ny * z)]) sl[[x, y, z][k]]++;
+  const nz2 = sl.filter((v) => v > 0), mx = Math.max(...nz2), mn = Math.min(...nz2.slice(Math.floor(nz2.length * 0.3), Math.ceil(nz2.length * 0.7)));
+  const thr = (mx + mn) / 2; let h0 = 0, h1 = 0; const f = sl.findIndex((v) => v > 0), l = sl.length - 1 - [...sl].reverse().findIndex((v) => v > 0);
+  for (let i = f; i <= l && sl[i] > thr; i++) h0++; for (let i = l; i >= f && sl[i] > thr; i--) h1++;
+  return Math.max(h0, h1) * r;
+}
+/** hinge joints from the current poses (works for searched and in-place inputs): links swing about their mount pivot
+ * from folded (parallel to the desk face) to hanging (−up); the carried part and its pins translate on the circle
+ * (coupled: counter-rotation about the coupler pivot, then rotation with the link about the ground pivot). */
+function linkageJoints(LK, P) {
+  const { e, ax, up, mount } = LK, J = {}, wc = (p, h) => h.center.clone().applyMatrix4(p.M), inPl = (v) => { const w = v.clone(); w.setComponent(ax, 0); return w; };
+  const piv = [LK.A, LK.B].map((q) => q.c);
+  let ground = null, couplerAt = null, swing = 0;
+  for (const l of LK.links) {
+    let g = wc(l.p, l.g), f = wc(l.p, l.f);
+    const dg = (x) => Math.min(...piv.map((c) => inPl(x).distanceTo(inPl(c))));
+    if (dg(f) < dg(g)) [g, f] = [f, g]; if (dg(g) > 2) continue;
+    const pv = piv.reduce((b, c) => (inPl(g).distanceTo(inPl(c)) < inPl(g).distanceTo(inPl(b)) ? c : b));
+    const ud = inPl(f).sub(inPl(pv)).normalize(), down = up.clone().negate();
+    const sg = V().crossVectors(e, ud).dot(down) >= 0 ? 1 : -1, ang = +(Math.acos(Math.max(-1, Math.min(1, ud.dot(down)))) * 180 / Math.PI).toFixed(1);
+    J[l.p.id] = { type: 'hinge', axis: e.toArray(), origin: pv.toArray(), range: [0, sg * ang], confidence: 0.8,
+      reason: `link: hole at each end, one on the ${pv === LK.A.c ? 'front/lower' : 'rear/upper'} pivot of ${mount.id}; swings ${ang}° from folded to hanging down`,
+      note: `${pretty(l.p.id)}: swings ${ang}° down about the mount pivot` };
+    if (pv === LK.A.c || !ground) { ground = pv; couplerAt = f; swing = sg * ang; }
+  }
+  if (!ground) return J;
+  const cpl = LK.links.flatMap((l) => [wc(l.p, l.g), wc(l.p, l.f)]).filter((x) => Math.min(...piv.map((c) => inPl(x).distanceTo(inPl(c)))) > 2);
+  const carried = [LK.ring, ...LK.pins.filter((p) => { const c = p.G.bb.getCenter(V()).applyMatrix4(p.M); return cpl.some((q) => inPl(c).distanceTo(inPl(q)) < 2); })].filter(Boolean);
+  const cAp = inPl(couplerAt); cAp.setComponent(ax, ground.getComponent(ax));
+  for (const p of carried) {
+    J[p.id] = { type: 'hinge', axis: e.toArray(), origin: cAp.toArray(), range: [0, -swing], confidence: 0.7,
+      chain: [{ axis: e.toArray(), origin: ground.toArray(), range: [0, swing] }],
+      reason: `${p === LK.ring ? 'carried by the links (parallelogram four-bar)' : 'pin in the carried part'}: moves on a ${LK.Lavg?.toFixed?.(0) ?? ''} mm circle and stays level (counter-rotation about the coupler pivot + swing about the mount pivot)`,
+      note: `${pretty(p.id)}: swings down ${Math.abs(swing)}° with the links, staying level` };
+  }
+  for (const p of LK.pins) if (!J[p.id]) J[p.id] = { type: 'fixed', confidence: 0.7, reason: `pin pressed into a ${mount.id} pivot`, note: `${pretty(p.id)}: pressed into ${mount.id}` };
+  return J;
+}
+
 /**
  * autoAssemble(parts, opts) -> Promise<{ poses, joints, guesses, mode, collisions, timeMs }>
  * parts: [{id, geometry}] ; opts: {poses?, base?, clearance=0.3, onProgress?(done,total,msg), signal?, trustInPlace=true}
@@ -414,7 +596,8 @@ export async function autoAssemble(parts, opts = {}) {
   const P = parts.map((p) => ({ id: p.id, geometry: p.geometry, given: toMat(opts.poses?.[p.id]) }));
   for (let i = 0; i < P.length; i++) { P[i].G = buildGrid(P[i].geometry); await tick(i + 1, P.length * 3, `analysed ${P[i].id}`); }
   const byVol = [...P].sort((a, b) => b.G.volume - a.G.volume);
-  const base = P.find((p) => p.id === opts.base) || byVol[0];
+  const LK = opts.linkage === false ? null : linkageInfo(P); // hinge linkage (mount + links + carried part + pins)?
+  const base = P.find((p) => p.id === opts.base) || LK?.mount || byVol[0];
   let baseW = base.given.clone(); const baseInv = baseW.clone().invert();
 
   // pass 1: keep every part that already sits plausibly in the assembly (shared CAD coordinates), per part.
@@ -452,8 +635,10 @@ export async function autoAssemble(parts, opts = {}) {
   for (const p of keep.kept) { p.conf = p === base ? 1 : 0.9; reasons[p.id] = p === base ? `base (${opts.base ? 'user-specified' : 'largest volume'})` : `kept: already fits the assembly in ${frame}`; }
   for (const [id, r] of Object.entries(keep.rej)) why[id] = r;
   if (!inPlace) {
+    // linkage: links / carried part / pins placed analytically on the mount's pivot holes; pass 2 handles the rest
+    const pre = LK && base === LK.mount ? linkagePlace(LK, clearance, reasons) : [];
     // pass 2: feature/fit search for the rest, largest first
-    const placed = [...keep.kept]; let k = 0;
+    const placed = [...new Set([...keep.kept, ...pre])]; let k = 0;
     for (const A of byVol.filter((p) => !placed.includes(p))) {
       if (placed.includes(A)) continue; // already placed as part of a group
       const asm = new THREE.Box3(); placed.forEach((q) => asm.union(worldBox(q))); const bv = (b) => { const z = b.getSize(V()); return z.x * z.y * z.z; }, av = bv(asm);
@@ -497,7 +682,7 @@ export async function autoAssemble(parts, opts = {}) {
     const hits = (p, M) => { const bb = p.G.bb.clone().applyMatrix4(M); let n = 0;
       for (const q of P) { if (q === p || q.unmatched || !bb.intersectsBox(worldBox(q))) continue;
         if (bvhOf(q).intersectsGeometry(p.geometry, q.M.clone().invert().multiply(M))) n++; } return n; };
-    const order = P.filter((p) => p !== base && !p.unmatched && !keptSet.has(p.id) && !pinAxis(p) && !(worldBox(p).getSize(V()).toArray().every((v) => v < 25) && p.G.volume < 0.01 * base.G.volume)) // pins / small fasteners: press fits, reported in result.expected.sort((a, b) => b.G.volume - a.G.volume);
+    const order = P.filter((p) => p !== base && !p.unmatched && !keptSet.has(p.id) && !LK?.ids.has(p.id) && !pinAxis(p) && !(worldBox(p).getSize(V()).toArray().every((v) => v < 25) && p.G.volume < 0.01 * base.G.volume)) // pins / small fasteners: press fits, reported in result.expected.sort((a, b) => b.G.volume - a.G.volume);
     let moved = 0;
     for (const p of order) {
       let n0 = hits(p, p.M); if (!n0) continue;
@@ -525,6 +710,7 @@ export async function autoAssemble(parts, opts = {}) {
   const childrenOf = (p) => new Set(P.filter((q) => q.matedTo === p.id && q.G.volume < p.G.volume).map((q) => q.id));
   let k2 = 0; const pinParent = {};
   for (const p of P) {
+    if (p !== base && LK?.ids.has(p.id)) { J[p.id] = { type: 'fixed', confidence: 0.5, reason: 'linkage' }; continue; }
     if (p !== base && p.matedTo && (pinAxis(p) || (p.G.volume < 0.01 * base.G.volume && Math.max(...worldBox(p).getSize(V()).toArray()) < 12))) { J[p.id] = { type: 'fixed', confidence: 0.5, reason: `pin/fastener-sized part seated in ${p.matedTo}` }; continue; }
     if (p === base || p.unmatched) { J[p.id] = { type: 'fixed', confidence: p === base ? 1 : 0, reason: p === base ? 'base' : 'unmatched' }; continue; }
     const skip = childrenOf(p), wb = worldBox(p), size = wb.getSize(V());
@@ -640,6 +826,8 @@ export async function autoAssemble(parts, opts = {}) {
     }
   }
 
+  if (LK && base === LK.mount) Object.assign(J, linkageJoints(LK, P));
+
   // ---- upright orientation (plate layouts, or opts.orient): one global rotation so the result faces forward like the
   // presets: backplate / back at +Y, drawer pulls out toward −Y (viewer), Z up (SKADIS hooks at the top), lowest point on z=0.
   let orient = null;
@@ -651,7 +839,9 @@ export async function autoAssemble(parts, opts = {}) {
     const bp = P.find((q) => q !== base && !q.unmatched && J[q.id].type === 'fixed' && !J[q.id].parent && (() => { const z = worldBox(q).getSize(V()).toArray().sort((a, b) => b - a); return z[2] < 0.25 * z[1] && z[0] * z[1] > 0.4 * bsz0[0] * bsz0[1]; })());
     const dr = P.find((q) => J[q.id].type === 'path' || (J[q.id].type === 'slider' && !rodOf(q.G)));
     let fwd = null, back = null, up = null, why2 = [];
-    if (dr) { const j = J[dr.id];
+    const desk = LK && base === LK.mount; // desk-mount linkage: screw face up at z = 0, links fold toward +Y, swing down toward −Y
+    if (desk) { back = LK.u.clone(); up = LK.up.clone(); why2.push(`desk mount: screw face of ${base.id} up (against the desk underside), links fold toward the back and swing down toward the viewer`); }
+    else if (dr) { const j = J[dr.id];
       if (j.type === 'path') fwd = V(...j.keyframes[1].value.pos);
       else { const r = j.range, t = Math.abs(r[1]) >= Math.abs(r[0]) ? r[1] : r[0]; fwd = V(...j.axis).multiplyScalar(Math.sign(t) || 1); }
       if (fwd.lengthSq() < 1e-9) fwd = null; }
@@ -674,7 +864,7 @@ export async function autoAssemble(parts, opts = {}) {
       const c0 = worldBox(base).applyMatrix4(baseW).getCenter(V()), c1 = worldBox(base).applyMatrix4(Gm).getCenter(V());
       const Rg = new THREE.Matrix4().extractRotation(baseW), same = Gm.elements.every((v, i) => Math.abs(v - Rg.elements[i]) < 1e-3);
       if (plate || !same || opts.orient === true) {
-        baseW = new THREE.Matrix4().makeTranslation(c0.x - c1.x, c0.y - c1.y, -bb.min.z).multiply(Gm);
+        baseW = new THREE.Matrix4().makeTranslation(c0.x - c1.x, c0.y - c1.y, desk ? -bb.max.z : -bb.min.z).multiply(Gm);
         orient = { rotation: Gm.toArray(), reason: why2.join(', ') + (plate ? '' : same ? '' : ' (input was not upright: re-oriented)') };
       } else orient = { rotation: Gm.toArray(), reason: why2.join(', ') + ' (already upright: kept given pose)' };
     }
@@ -689,6 +879,7 @@ export async function autoAssemble(parts, opts = {}) {
   const roleOf = (p) => { const j = J[p.id], sz = worldBox(p).getSize(V()).toArray().sort((a, b) => b - a);
     if (p === base) return 'base';
     if (p.unmatched) return 'part';
+    if (LK?.ids.has(p.id)) return LK.pins.includes(p) ? 'pin' : p === LK.ring ? 'carrier' : 'link';
     if (j.type === 'path') return 'drawer';
     if (j.type === 'slider') return rodOf(p.G) ? 'button' : 'drawer';
     if (j.type === 'hinge') return 'lever';
@@ -708,6 +899,7 @@ export async function autoAssemble(parts, opts = {}) {
       keyframes: j.keyframes.map((k) => ({ t: k.t, value: { pos: V(...k.value.pos).transformDirection(R3).multiplyScalar(V(...k.value.pos).length()).toArray().map((v) => +v.toFixed(3)), angle: k.value.angle } })) };
     if (j.type === 'hinge') mj = { part: p.id, type: 'hinge', axis: V(...j.axis).transformDirection(R3).toArray().map((v) => +v.toFixed(6)), origin: V(...j.origin).applyMatrix4(baseW).toArray(), range: j.range };
     if (mj) joints.push({ ...mj, confidence: j.confidence, reason: j.reason, note: j.note });
+    for (const c of j.chain || []) joints.push({ part: p.id, type: 'hinge', axis: V(...c.axis).transformDirection(R3).toArray().map((v) => +v.toFixed(6)), origin: V(...c.origin).applyMatrix4(baseW).toArray(), range: c.range, confidence: j.confidence, reason: j.reason, note: j.note });
     guesses.push({ part: p.id, role: roles[p.id], matedTo: p.matedTo, poseConfidence: p.conf ?? 0, joint: j.parent ? 'fixed(parent ' + j.parent + ')' : j.type, jointConfidence: j.confidence, reason: reasons[p.id] + ' | ' + j.reason, note: j.note || note });
   }
   const cp = checkPose(P, W, { tolerance: 0 });
