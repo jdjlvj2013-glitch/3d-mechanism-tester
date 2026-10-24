@@ -24,6 +24,9 @@ export default defineConfig({
         ],
       },
       workbox: {
+        skipWaiting: true,
+        clientsClaim: true,
+        cleanupOutdatedCaches: true,
         globPatterns: ['**/*.{js,css,html,svg,png,ico,wasm,woff2}', 'models/**/*', 'samples/**/*'],
         maximumFileSizeToCacheInBytes: 20 * 1024 * 1024, // three.js chunks
         navigateFallback: 'index.html',

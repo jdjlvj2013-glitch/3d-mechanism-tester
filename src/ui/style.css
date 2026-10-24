@@ -22,3 +22,8 @@
 .mt .presets .card{cursor:pointer}.mt .presets .card:hover{background:#3a3a3a}
 .mt .badge{font-size:11px;padding:1px 5px;border-radius:3px;background:#444;margin-left:4px}
 .mt .swatch{width:22px;height:20px;padding:0;border:0}
+@media (max-width:900px){
+  .mt{grid-template-columns:1fr;grid-template-rows:auto 60vh auto;height:auto;min-height:100%}
+  .mt aside{border:0}
+  .mt .view{min-height:60vh}
+}
