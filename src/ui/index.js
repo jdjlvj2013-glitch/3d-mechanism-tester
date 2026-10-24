@@ -2,7 +2,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { ThreeMFLoader } from 'three/examples/jsm/loaders/3MFLoader.js';
-import { checkPose, solveJoints, sweepAsync, classify, loadSTL, engineInfo, toXYZ, autoAssemble } from './engine.js';
+import { checkPose, solveJoints, sweepAsync, classify, loadSTL, engineInfo, toXYZ, autoAssemble, stubAutoAssemble } from './engine.js';
 import { listPresets } from './presets.js';
 import './style.css';
 
@@ -261,7 +261,7 @@ export function mount(root) {
     const live = A.items.filter(i => i.status !== 'undone'), mine = new Set(A.items.map(i => i.joint));
     const posed = new Set(live.filter(i => i.kind === 'pose').map(i => i.part));
     const extra = S.joints.filter(j => !A.snapshot.includes(j) && !mine.has(j));
-    S.joints = [...A.snapshot.filter(j => !(posed.has(j.part) && j.type === 'fixed' && !j.parent)), ...live.map(i => i.joint), ...extra];
+    S.joints = [...A.snapshot.filter(j => !(posed.has(j.part) && j.type === 'fixed')), ...live.map(i => i.joint), ...extra];
     for (const p of S.parts) p.fixed = A.fixed[p.id] ?? p.fixed;
     live.filter(i => i.kind === 'joint' && i.joint.type !== 'fixed').forEach(i => { const p = S.parts.find(x => x.id === i.part); if (p) p.fixed = false; });
     renderAll(); renderAuto();
@@ -271,6 +271,7 @@ export function mount(root) {
     if (!A) { box.innerHTML = ''; return; }
     const pn = (id) => esc(S.parts.find(p => p.id === id)?.name || id);
     box.innerHTML = `<div class="card auto"><div class="row"><b style="flex:1">Auto-assemble guesses</b><span class="badge">${A.source === 'engine' ? "Gram's engine" : 'stub'}</span></div>
+      ${S.autoResult?.mode ? `<div class="hint">${S.autoResult.mode === 'in-place' ? 'Parts were already in place; motions guessed.' : 'Parts placed by fit search.'} ${(S.autoResult.ms / 1000).toFixed(1)} s</div>` : ''}
       ${A.items.length ? '' : '<div class="hint">No guesses returned.</div>'}
       ${A.items.map((it, k) => `<div class="auto-item ${it.status}" data-i="${k}"><div class="row"><b>${pn(it.part)}</b><span class="hint">${it.kind === 'pose' ? 'position' : esc(it.joint.type)}</span>
         <span class="conf ${lvl(it.confidence)}" title="${Math.round(it.confidence * 100)}%">${lvl(it.confidence)}</span></div>
@@ -288,18 +289,32 @@ export function mount(root) {
     if (!S.parts.length) return alert('Add some parts first.');
     if (S.auto) S.auto.items.forEach(i => i.status === 'pending' && (i.status = 'accepted'));
     const run = ++autoRun, btn = q('[data-a=auto]'), box = q('[data-s=auto]');
-    btn.disabled = true; S.autoBusy = true;
-    box.innerHTML = '<div class="card row"><span class="spin"></span><span data-k="ap">Working out how the parts fit…</span></div>';
+    btn.disabled = true; S.autoBusy = true; S.autoProgress = [];
+    const ac = new AbortController(); S.autoAbort = ac; const t0 = performance.now();
+    box.innerHTML = '<div class="card"><div class="row"><span class="spin"></span><span data-k="ap" style="flex:1">Working out how the parts fit…</span><button class="sec" data-k="acancel">Cancel</button></div><progress max="1" value="0" style="width:100%"></progress></div>';
+    box.querySelector('[data-k=acancel]').onclick = () => ac.abort();
     let res;
     try {
       const parts = S.parts.map(p => ({ id: p.id, name: p.name, geometry: p.geometry }));
-      res = await autoAssemble(parts, { onProgress: (d, t) => { const e = box.querySelector('[data-k=ap]'); if (e && run === autoRun) e.textContent = `Working out how the parts fit… ${d}/${t}`; } }, ...(impl ? [impl] : []));
-    } catch (e) { box.innerHTML = `<div class="bad">Auto-assemble failed: ${esc(e.message)}</div>`; return; }
-    finally { btn.disabled = false; S.autoBusy = false; }
+      const poses = Object.fromEntries(S.parts.map(p => [p.id, p.mesh.matrix.toArray()]));
+      res = await autoAssemble(parts, { poses, clearance: S.tolerance, signal: ac.signal, onProgress: (d, t, msg) => {
+        if (run !== autoRun) return; S.autoProgress.push([d, t, Math.round(performance.now() - t0)]);
+        const e = box.querySelector('[data-k=ap]'), pg = box.querySelector('progress');
+        if (e) e.textContent = `Working out how the parts fit… ${d}/${t}${msg ? ' · ' + msg : ''}`; if (pg) pg.value = t ? d / t : 0; } }, ...(impl ? [impl] : []));
+    } catch (e) {
+      if (run === autoRun) box.innerHTML = e?.name === 'AbortError' ? '<div class="hint">Auto-assemble cancelled. Nothing was changed.</div>' : `<div class="bad">Auto-assemble failed: ${esc(e?.message || e)}</div>`;
+      S.autoResult = { status: e?.name === 'AbortError' ? 'cancelled' : 'error', ms: Math.round(performance.now() - t0) }; return;
+    } finally { btn.disabled = false; S.autoBusy = false; }
     if (run !== autoRun) return;
+    S.autoResult = { status: 'ok', ms: Math.round(performance.now() - t0), mode: res.mode };
+    // engine gives each part a fixed joint with offset (= its pose, maybe relative to a parent); use it as the pose item
+    const placeJ = new Map(res.joints.filter(j => j.type === 'fixed' && j.offset).map(j => [j.part, j]));
+    const strip = (j) => (({ confidence, reason, ...r }) => ({ ...r, auto: true }))(j);
     const items = [
-      ...res.poses.map(p => ({ kind: 'pose', part: p.id, confidence: p.confidence, reason: p.reason, status: 'pending', joint: { id: 'autopose_' + p.id, type: 'fixed', part: p.id, offset: p.matrix.toArray(), axis: [1, 0, 0], origin: [0, 0, 0], range: [0, 0], auto: true } })),
-      ...res.joints.map(j => ({ kind: 'joint', part: j.part, confidence: j.confidence, reason: j.reason, status: 'pending', joint: (({ confidence, reason, ...r }) => ({ ...r, auto: true }))(j) })),
+      ...res.poses.map(p => { const pj = placeJ.get(p.id);
+        return { kind: 'pose', part: p.id, confidence: p.confidence, reason: (pj?.parent && pj.reason) || p.reason, status: 'pending',
+          joint: pj ? { axis: [1, 0, 0], origin: [0, 0, 0], range: [0, 0], ...strip(pj) } : { id: 'autopose_' + p.id, type: 'fixed', part: p.id, offset: p.matrix.toArray(), axis: [1, 0, 0], origin: [0, 0, 0], range: [0, 0], auto: true } }; }),
+      ...res.joints.filter(j => !(j.type === 'fixed' && j.offset && res.poses.some(p => p.id === j.part))).map(j => ({ kind: 'joint', part: j.part, confidence: j.confidence, reason: j.reason, status: 'pending', joint: strip(j) })),
     ];
     S.auto = { source: res.source, snapshot: [...S.joints], fixed: Object.fromEntries(S.parts.map(p => [p.id, p.fixed])), items };
     S.lastAuto = res; autoRebuild(); frame();
@@ -375,7 +390,7 @@ export function mount(root) {
   app.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.remove('over'); const fs = [...e.dataTransfer.files].filter(f => /\.(stl|3mf)$/i.test(f.name)); if (fs.length) addFiles(fs); else if (e.dataTransfer.files[0]?.name.endsWith('.json')) loadProjectFile(e.dataTransfer.files[0]); });
 
   // test hook (used by headless tests)
-  const api = { state: S, async addBuffer(name, buf) { await loadFile(name, buf); hideStart(); renderAll(); frame(); }, applyProject, setT, setTol, runSweep, listPresets, openPreset, frame, update, runAuto, poses: () => Object.fromEntries(S.parts.map(p => [p.id, p.mesh.matrix.toArray()])) };
+  const api = { state: S, async addBuffer(name, buf) { await loadFile(name, buf); hideStart(); renderAll(); frame(); }, applyProject, setT, setTol, runSweep, listPresets, openPreset, frame, update, runAuto, stubAutoAssemble, poses: () => Object.fromEntries(S.parts.map(p => [p.id, p.mesh.matrix.toArray()])) };
   window.__mechTester = api;
   return api;
 }

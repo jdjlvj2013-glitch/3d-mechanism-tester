@@ -45,8 +45,10 @@ engineInfo.sweepAsync = typeof real.sweepAsync === 'function' ? 'engine' : 'stub
 //           ([x,y,z] Euler radians XYZ | [x,y,z,w] quaternion | Matrix4/16 numbers), confidence, reason|why }
 //   joint: { part, type 'slider'|'hinge'|'fixed', axis, origin, range, confidence, reason }
 import * as THREE_ from 'three';
-engineInfo.autoAssemble = typeof real.autoAssemble === 'function' ? 'engine' : 'stub';
-const rawAuto = pick('autoAssemble', stub.autoAssemble);
+// Prefer the Web Worker version (keeps the page responsive); then main-thread engine; then stub.
+const fnA = (n) => typeof real[n] === 'function';
+engineInfo.autoAssemble = fnA('autoAssembleAsync') || fnA('autoAssemble') ? 'engine' : 'stub';
+const rawAuto = fnA('autoAssembleAsync') ? real.autoAssembleAsync : pick('autoAssemble', stub.autoAssemble);
 const num = (v, d) => (Number.isFinite(+v) ? +v : d);
 const conf = (c) => Math.min(1, Math.max(0, num(c, 0.5)));
 const vec3 = (v, d) => { if (!v) return d; const a = Array.isArray(v) ? v : [v.x, v.y, v.z]; return a.length >= 3 && a.slice(0, 3).every(x => Number.isFinite(+x)) ? a.slice(0, 3).map(Number) : d; };
@@ -72,9 +74,11 @@ export function normalizeAutoAssemble(res, parts = []) {
     const rg = Array.isArray(j.range) && j.range.length >= 2 ? [num(j.range[0], 0), num(j.range[1], 0)] : (type === 'hinge' ? [0, 90] : type === 'slider' ? [0, 50] : [0, 0]);
     return { ...j, id: j.id || 'auto' + Date.now() + '_' + i, part: j.part, type, axis: vec3(j.axis, [1, 0, 0]), origin: vec3(j.origin, [0, 0, 0]), range: rg, confidence: conf(j.confidence ?? j.score), reason: String(j.note ?? j.reason ?? j.why ?? '') || 'no reason given' };
   });
-  return { source: res?.source || engineInfo.autoAssemble, poses, joints };
+  return { source: res?.source || engineInfo.autoAssemble, poses, joints, mode: res?.mode, base: res?.base, timeMs: res?.timeMs, collisions: res?.collisions || [] };
 }
+export const stubAutoAssemble = stub.autoAssemble;
 export async function autoAssemble(parts, opts = {}, impl = rawAuto) {
+  if (opts.signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
   await new Promise(r => setTimeout(r, 0)); // let the spinner paint before a possibly sync engine call
   return normalizeAutoAssemble(await impl(parts, opts), parts);
 }
