@@ -294,7 +294,7 @@ export function mount(root) {
     box.querySelectorAll('.auto-item').forEach(d => { const it = A.items[+d.dataset.i];
       d.querySelectorAll('[data-k]').forEach(b => b.onclick = () => { it.status = b.dataset.k === 'acc' ? 'accepted' : b.dataset.k === 'undo' ? 'undone' : 'pending'; autoRebuild(); }); });
     box.querySelector('[data-k=accall]').onclick = () => { A.items.forEach(i => i.status !== 'undone' && (i.status = 'accepted')); S.auto = null; renderAuto(); };
-    box.querySelector('[data-k=undoall]').onclick = () => { A.items.forEach(i => (i.status = 'undone')); autoRebuild(); S.joints = [...A.snapshot]; S.auto = null; renderAll(); renderAuto(); };
+    box.querySelector('[data-k=undoall]').onclick = () => { A.items.forEach(i => (i.status = 'undone')); autoRebuild(); S.joints = [...A.snapshot]; if (S.auto?.expBefore) S.expected = S.auto.expBefore; S.auto = null; renderAll(); renderAuto(); };
   }
   async function runAuto(impl) {
     if (!S.parts.length) return alert('Add some parts first.');
@@ -331,7 +331,8 @@ export function mount(root) {
           joint: pj ? { axis: [1, 0, 0], origin: [0, 0, 0], range: [0, 0], ...strip(pj) } : { id: 'autopose_' + p.id, type: 'fixed', part: p.id, offset: p.matrix.toArray(), axis: [1, 0, 0], origin: [0, 0, 0], range: [0, 0], auto: true } }; }),
       ...res.joints.filter(j => !(j.type === 'fixed' && j.offset && res.poses.some(p => p.id === j.part))).map(j => ({ kind: 'joint', part: j.part, confidence: j.confidence, reason: j.reason, status: 'pending', joint: strip(j) })),
     ];
-    S.auto = { source: res.source, snapshot: [...S.joints], fixed: Object.fromEntries(S.parts.map(p => [p.id, p.fixed])), items };
+    const expBefore = [...S.expected]; if (res.expected?.length) S.expected = [...S.expected, ...res.expected];
+    S.auto = { source: res.source, expBefore, snapshot: [...S.joints], fixed: Object.fromEntries(S.parts.map(p => [p.id, p.fixed])), items };
     S.lastAuto = res; autoRebuild(); frame();
   }
   function renderAll() { renderParts(); renderJoints(); S.sweepAbort?.abort(); sweepRun++; S.sweepResult = null; q('[data-s=sweep]').innerHTML = ''; update(); }
