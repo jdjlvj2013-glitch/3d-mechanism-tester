@@ -287,6 +287,78 @@ function pinAxis(P) { // elongated, round-ish bbox -> pin along long axis (world
   return c >= 1.8 * b && b / a < 1.5 && b < 15 ? { a: idx[2], center: worldBox(P).getCenter(V()) } : null;
 }
 
+
+// ---------- group placement (part + its fasteners) ----------
+const maxDim = (q) => { const z = q.G.bb.getSize(V()); return Math.max(z.x, z.y, z.z); };
+const pinVal = (s) => s.cf - 25 * s.of;
+function groupPlace(A, placed, best, all, byVol, clr) {
+  if (maxDim(A) < 25 || !holesOf(A.G).length) return null;
+  const sig = (q) => q.G.bb.getSize(V()).toArray().sort((a, b) => a - b).map((v) => v.toFixed(1)).join(',') + '|' + Math.round(q.G.volume);
+  const sets = {}; for (const q of byVol) if (q !== A && !placed.includes(q) && maxDim(q) < 25) (sets[sig(q)] ||= []).push(q);
+  const A0 = { id: A.id, G: A.G, M: new THREE.Matrix4() }, att = [];
+  for (const S of Object.values(sets).filter((x) => x.length >= 2)) {
+    const p0 = S[0], ctr = p0.G.bb.getCenter(V());
+    const cs = candidates(p0, [A0], clr).filter((c) => c.hole).map((M) => ({ M, s: score(p0, M, [A0]), c: ctr.clone().applyMatrix4(M) })).filter((c) => c.s.of < 0.02 && c.s.cf > 0.15);
+    const holes = [];
+    for (const h of holesOf(A.G)) {
+      const [b, c2] = [0, 1, 2].filter((q) => q !== h.a);
+      const vs = cs.filter((c) => Math.hypot(c.c.getComponent(b) - h.center.getComponent(b), c.c.getComponent(c2) - h.center.getComponent(c2)) < 1.5 && Math.abs(c.c.getComponent(h.a) - h.center.getComponent(h.a)) < 8)
+        .sort((x, y) => y.s.s - x.s.s).filter((c, i, arr) => arr.findIndex((d) => d.c.distanceTo(c.c) < 0.5) === i).slice(0, 3);
+      if (vs.length && holes.every((o) => o.h.center.distanceTo(h.center) > 3)) holes.push({ h, vs });
+    }
+    if (holes.length < 2) continue;
+    holes.sort((x, y) => y.vs[0].s.s - x.vs[0].s.s);
+    // copies may sit elsewhere on a plate: map each copy onto S[0]'s local frame (same orientation, translated)
+    const sz0 = p0.G.bb.getSize(V());
+    S.filter((q) => q.G.bb.getSize(V()).distanceTo(sz0) < 0.1).forEach((q, i) => { if (!holes[i]) return; const t = p0.G.bb.min.clone().sub(q.G.bb.min), Tq = new THREE.Matrix4().makeTranslation(t.x, t.y, t.z);
+      att.push({ S: q, h: holes[i].h, vars: holes[i].vs.map((v) => ({ ...v, M: v.M.clone().multiply(Tq) })) }); });
+  }
+  if (!att.length) return null;
+  const others = placed, tmp = new THREE.Matrix4();
+  const pinsAt = (M, early = false) => { let t = 0; const ch = []; for (const a of att) { let bv = -Infinity, bvv = null; for (const v of a.vars) { const s = pinVal(score(a.S, tmp.copy(M).multiply(v.M), others)); if (s > bv) { bv = s; bvv = v; } } if (early && bv < -0.05) return { t: -1, ch }; t += bv; ch.push(bvv); } return { t: t / att.length, ch }; };
+  const asm = new THREE.Box3(); others.forEach((q) => asm.union(worldBox(q)));
+  const vol = (b) => { if (b.isEmpty()) return 0; const z = b.getSize(V()); return z.x * z.y * z.z; };
+  // prefer the closed / pushed-in end of a slide path: penalise the share of A sticking out of the assembly
+  const outOf = (M) => { const b = A.G.bb.clone().applyMatrix4(M); return 1 - vol(b.clone().intersect(asm)) / (vol(b) || 1); };
+  const total = (M, pv) => { const s = score(A, M, others); return { tot: pinVal(s) + pv - 2 * outOf(M), s }; };
+  // start poses: distinct top candidates of A
+  const starts = [];
+  for (const c of [best, ...all]) { if (starts.length >= 5) break; if (c.s.of > 0.05) continue;
+    if (starts.every((o) => { const e = o.M.elements, f = c.M.elements; return Math.max(...[0, 1, 2, 4, 5, 6, 8, 9, 10].map((i) => Math.abs(e[i] - f[i]))) > 0.1 || Math.hypot(e[12] - f[12], e[13] - f[13], e[14] - f[14]) > 14; })) starts.push(c); }
+  let top = null; const step = Math.max(1, A.G.r);
+  for (const st of starts) {
+    const pa = worldAxis(st.M, { a: att[0].h.a, s: 1 }).a, [b, c2] = [0, 1, 2].filter((q) => q !== pa), cand = [];
+    const fs = 1; // coarse pass; groove clearances are a few tenths of a mm, so accept near-misses here
+    for (let i = -14; i <= 14; i++) for (let j = -14; j <= 14; j++) {
+      const d = V(); d.setComponent(b, i * fs); d.setComponent(c2, j * fs);
+      const M = new THREE.Matrix4().makeTranslation(d.x, d.y, d.z).multiply(st.M), pv = pinsAt(M, true);
+      if (pv.t > -0.5) cand.push({ M, pv: pv.t, key: pv.t - 2 * outOf(M) });
+    }
+    cand.sort((x, y) => y.key - x.key);
+    // coarse grid hits -> fine neighbourhood (pin axis +-0.4, plane +-0.5)
+    const fine = [];
+    for (const c of cand.slice(0, 40)) for (const w of [-0.4, 0, 0.4]) for (const i of [-0.5, 0, 0.5]) for (const j of [-0.5, 0, 0.5]) {
+      const d = V(); d.setComponent(pa, w); d.setComponent(b, i); d.setComponent(c2, j);
+      const M = new THREE.Matrix4().makeTranslation(d.x, d.y, d.z).multiply(c.M), pv = pinsAt(M, true);
+      if (pv.t > 0) fine.push({ M, pv: pv.t, key: pv.t - 2 * outOf(M) });
+    }
+    fine.sort((x, y) => y.key - x.key);
+    for (const c of fine.slice(0, 60)) { const r = total(c.M, c.pv); if (r.s.of < 0.05 && (!top || r.tot > top.tot + 1e-4)) top = { M: c.M, tot: r.tot, s: r.s }; }
+  }
+  if (!top) return null;
+  // local refinement of the whole group
+  for (let it = 0; it < 6; it++) { let imp = false;
+    for (let a = 0; a < 3; a++) for (const d of [-step, -step / 2, step / 2, step]) {
+      const t = V(); t.setComponent(a, d); const M = new THREE.Matrix4().makeTranslation(t.x, t.y, t.z).multiply(top.M), pv = pinsAt(M).t, r = total(M, pv);
+      if (r.s.of < 0.05 && r.tot > top.tot + 0.002) { top = { M, tot: r.tot, s: r.s }; imp = true; } }
+    if (!imp) break; }
+  const base0 = total(best.M, pinsAt(best.M).t);
+  if (top.tot <= base0.tot + 1e-4 && pinsAt(best.M).t <= 0) return null;
+  if (base0.tot >= top.tot) top = { M: best.M, tot: base0.tot, s: base0.s };
+  const ch = pinsAt(top.M).ch; att.forEach((a, i) => { a.v = ch[i]; });
+  return { best: { M: top.M, s: top.s, group: true }, att };
+}
+
 // ---------- main ----------
 // print-plate layout (e.g. a slicer 3MF): every part lies on z=0 in its given pose and the XY footprints are disjoint.
 // Such coordinates say nothing about the assembly, so pass 1 (keep in place) is skipped.
@@ -354,6 +426,7 @@ export async function autoAssemble(parts, opts = {}) {
     // pass 2: feature/fit search for the rest, largest first
     const placed = [...keep.kept]; let k = 0;
     for (const A of byVol.filter((p) => !placed.includes(p))) {
+      if (placed.includes(A)) continue; // already placed as part of a group
       const asm = new THREE.Box3(); placed.forEach((q) => asm.union(worldBox(q))); const bv = (b) => { const z = b.getSize(V()); return z.x * z.y * z.z; }, av = bv(asm);
       // flush with the assembly outline is preferred (small penalty for growing the overall bounding box)
       const sc = (M, bonus, face = true) => { const s = score(A, M, placed); s.s += (bonus && s.cf > 0.05 ? bonus : 0) - (face ? 0.1 : 0) * (bv(asm.clone().union(A.G.bb.clone().applyMatrix4(M))) - av) / av; return s; };
@@ -369,12 +442,19 @@ export async function autoAssemble(parts, opts = {}) {
           if (s.s > best.s.s + 0.005) best = { M, s };
         }
       }
+      // group placement: identical small fasteners (≥ 2 copies) that fit A's own holes are attached to A first, then A + pins
+      // is positioned as one rigid group (e.g. a drawer hanging on pins in housing grooves: the pins must not hit walls)
+      const grp = opts.group !== false && best ? groupPlace(A, placed, best, all, byVol, clearance) : null;
+      if (grp) best = grp.best;
       if (best && best.s.cf > 0.02 && best.s.of < 0.05) {
-        A.M = best.hole ? (best.holeAxis !== undefined ? refine(A, best.M, placed, [best.holeAxis]) : best.M) : refine(A, best.M, placed);
+        if (grp) { A.M = best.M; for (const a of grp.att) { a.S.M = best.M.clone().multiply(a.v.M); const s = score(a.S, a.S.M, [...placed, A]);
+          a.S.conf = +Math.max(0.05, Math.min(0.95, s.cf * 2 - s.of * 10)).toFixed(2);
+          reasons[a.S.id] = `${why[a.S.id] ? 'pass 1: ' + why[a.S.id] + '; ' : ''}placed with ${A.id} as a group: fastener in its hole, contact ${(s.cf * 100).toFixed(0)}%, overlap ${(s.of * 100).toFixed(1)}%`; } }
+        else A.M = best.hole ? (best.holeAxis !== undefined ? refine(A, best.M, placed, [best.holeAxis]) : best.M) : refine(A, best.M, placed);
         const s = score(A, A.M, placed); // hole-aligned: keep the axis exact
         A.conf = +Math.max(0.05, Math.min(0.95, s.cf * 2 - s.of * 10)).toFixed(2);
         reasons[A.id] = `${why[A.id] ? 'pass 1: ' + why[A.id] + '; ' : ''}best of ${ROTATIONS_24.length} rotations × cavity/face alignments: contact ${(s.cf * 100).toFixed(0)}% of surface, overlap ${(s.of * 100).toFixed(1)}%`;
-        placed.push(A);
+        placed.push(A); if (grp) { for (const a of grp.att) placed.push(a.S); reasons[A.id] += `; positioned together with ${grp.att.length} fasteners (${grp.att.map((a) => a.S.id).join(', ')})`; }
       } else { A.M = A.M || new THREE.Matrix4(); A.conf = 0; A.unmatched = true; reasons[A.id] = `${why[A.id] ? 'pass 1: ' + why[A.id] + '; ' : ''}no fitting placement found; left in place`; }
       await tick(P.length + ++k, P.length * 3, `placed ${A.id}`);
     }
