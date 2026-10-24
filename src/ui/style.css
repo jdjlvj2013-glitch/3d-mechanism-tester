@@ -35,3 +35,5 @@
 @keyframes mtspin{to{transform:rotate(360deg)}}
 .mt button:disabled{opacity:.5;cursor:wait}
 @media (max-width:900px){.mt .auto-item button{padding:9px 14px;min-height:40px}}
+.mt .bar button.small{padding:5px 7px;font-size:12px}
+@media (max-width:900px){.mt .bar{flex-wrap:wrap}.mt .bar [data-s=tval]{min-width:0!important}}

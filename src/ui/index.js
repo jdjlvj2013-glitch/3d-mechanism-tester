@@ -35,6 +35,7 @@ export function mount(root) {
    </aside>
    <div class="view"><div class="bar">
      <button data-a="play" title="Play / pause">▶</button>
+     <button class="sec" data-a="turnx" title="Turn the view 90° about X (display only)">Turn 90°</button><button class="sec small" data-a="turnz" title="Turn the view 90° about Z (display only)">⟳Z</button>
      <span>Motion</span><input type="range" min="0" max="1000" value="0" data-s="slider"><span data-s="tval" style="min-width:150px">0%</span></div>
    </div>
    <aside class="r">
@@ -62,7 +63,17 @@ export function mount(root) {
   const dl = new THREE.DirectionalLight(0xffffff, 1.4); dl.position.set(100, -150, 250); scene.add(dl);
   const grid = new THREE.GridHelper(400, 40, 0x556677, 0x333a40); grid.rotation.x = Math.PI / 2; scene.add(grid);
   scene.add(new THREE.AxesHelper(60));
-  const markers = new THREE.Group(); scene.add(markers);
+  // display-only root: all part meshes + markers live here; rotating it never touches poses or collision checks; grid stays in scene
+  const world = new THREE.Group(); world.name = 'viewRoot'; scene.add(world);
+  const markers = new THREE.Group(); world.add(markers);
+  function setView(v = {}) {
+    S.view = { rx: ((Math.round(+v.rx || 0) % 4) + 4) % 4, rz: ((Math.round(+v.rz || 0) % 4) + 4) % 4 };
+    world.rotation.set(0, 0, 0); world.rotateZ(S.view.rz * Math.PI / 2); world.rotateX(-S.view.rx * Math.PI / 2) /* -90° per press: face-up print layout (+Z back) -> standing, backplate at +Y rear */; world.position.set(0, 0, 0); world.updateMatrixWorld(true);
+    if (S.view.rx || S.view.rz) { const bb = new THREE.Box3(); S.parts.forEach(p => p.mesh && bb.expandByObject(p.mesh)); if (!bb.isEmpty()) { world.position.z = -bb.min.z; world.updateMatrixWorld(true); } } // sit on the grid
+    const bx = q('[data-a=turnx]'); if (bx) bx.textContent = `Turn 90° (X ${S.view.rx * 90}°)`;
+    const bz = q('[data-a=turnz]'); if (bz) bz.textContent = `⟳Z ${S.view.rz * 90}°`;
+    frame();
+  }
   const resize = () => { const w = view.clientWidth, h = view.clientHeight; renderer.setSize(w, h); camera.aspect = w / h; camera.updateProjectionMatrix(); };
   new ResizeObserver(resize).observe(view); resize();
   let last = performance.now();
@@ -85,7 +96,7 @@ export function mount(root) {
     const id = opts.id || name.replace(/\.\w+$/, '') + (S.parts.some(p => p.id === name.replace(/\.\w+$/, '')) ? '_' + (++uid) : '');
     const color = opts.color || COLORS[S.parts.length % COLORS.length];
     const mat = new THREE.MeshStandardMaterial({ color, metalness: 0.05, roughness: 0.7, transparent: true, opacity: 0.85 });
-    const mesh = new THREE.Mesh(geometry, mat); mesh.matrixAutoUpdate = false; scene.add(mesh);
+    const mesh = new THREE.Mesh(geometry, mat); mesh.matrixAutoUpdate = false; world.add(mesh);
     const p = { id, name: opts.name || name, file: opts.file || name, color, visible: true, fixed: opts.fixed ?? S.parts.length === 0, geometry, mesh };
     S.parts.push(p); return p;
   }
@@ -102,7 +113,7 @@ export function mount(root) {
     for (const f of files) { try { await loadFile(f.name, await f.arrayBuffer()); } catch (e) { alert(`Couldn't read ${f.name}: ${e.message}`); } }
     hideStart(); renderAll(); frame();
   }
-  function removePart(p) { scene.remove(p.mesh); S.parts = S.parts.filter(x => x !== p); S.joints = S.joints.filter(j => j.part !== p.id); renderAll(); }
+  function removePart(p) { world.remove(p.mesh); S.parts = S.parts.filter(x => x !== p); S.joints = S.joints.filter(j => j.part !== p.id); renderAll(); }
 
   function renderParts() {
     const box = q('[data-s=parts]'); box.innerHTML = S.parts.length ? '' : '<div class="hint">No parts yet. Drag STL/3MF files onto the window.</div>';
@@ -302,7 +313,7 @@ export function mount(root) {
         const e = box.querySelector('[data-k=ap]'), pg = box.querySelector('progress');
         if (e) e.textContent = `Working out how the parts fit… ${d}/${t}${msg ? ' · ' + msg : ''}`; if (pg) pg.value = t ? d / t : 0; } }, ...(impl ? [impl] : []));
     } catch (e) {
-      if (run === autoRun) box.innerHTML = e?.name === 'AbortError' ? '<div class="hint">Auto-assemble cancelled. Nothing was changed.</div>' : `<div class="bad">Auto-assemble failed: ${esc(e?.message || e)}</div>`;
+      if (run === autoRun) box.innerHTML = e?.name === 'AbortError' ? '<div class="hint">Auto-assemble cancelled. Nothing was changed.</div>' : `<div class="bad">Auto-assemble failed: ${esc(e?.message || (e?.type ? `worker ${e.type}${e.filename ? " in " + e.filename : ""} (the engine worker crashed — try again)` : String(e)))}</div>`;
       S.autoResult = { status: e?.name === 'AbortError' ? 'cancelled' : 'error', ms: Math.round(performance.now() - t0) }; return;
     } finally { btn.disabled = false; S.autoBusy = false; }
     if (run !== autoRun) return;
@@ -327,7 +338,7 @@ export function mount(root) {
 
   // ---------- project save/load ----------
   function saveProject() {
-    const data = { app: '3d-mechanism-tester', version: 1, settings: { tolerance: S.tolerance, t: S.t },
+    const data = { app: '3d-mechanism-tester', version: 1, settings: { tolerance: S.tolerance, t: S.t, view: S.view },
       parts: S.parts.map(({ id, name, file, color, visible, fixed }) => ({ id, name, file, color, visible, fixed })), joints: S.joints, ignorePairs: S.ignorePairs, expected: S.expected };
     const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })); a.download = 'mechanism-project.json'; a.click();
   }
@@ -335,6 +346,7 @@ export function mount(root) {
     S.ignorePairs = d.ignorePairs || []; S.expected = d.expected || [];
     S.joints = (d.joints || []).map(j => ({ origin: [0, 0, 0], axis: [1, 0, 0], range: [0, 0], ...j }));
     if (d.settings?.tolerance != null) setTol(d.settings.tolerance);
+    if (d.settings?.view) setView(d.settings.view);
     const used = new Set();
     for (const sp of d.parts || []) { const p = S.parts.find(x => x.id === sp.id && !used.has(x)) || S.parts.find(x => x.file === sp.file && !used.has(x)); if (!p) continue; used.add(p);
       Object.assign(p, { id: sp.id || p.id, name: sp.name || p.name, fixed: !!sp.fixed, visible: sp.visible !== false });
@@ -348,7 +360,7 @@ export function mount(root) {
     applyProject(d);
   }
   async function openPreset(pr) {
-    S.parts.forEach(p => scene.remove(p.mesh)); S.parts = []; S.joints = []; S.ignorePairs = []; S.expected = [];
+    S.parts.forEach(p => world.remove(p.mesh)); S.parts = []; S.joints = []; S.ignorePairs = []; S.expected = [];
     const fails = [];
     for (const sp of pr.parts) {
       try { const r = await fetch(sp.url); if (!r.ok) throw new Error(r.status); await loadFile(sp.file || sp.url, await r.arrayBuffer(), { id: sp.id, name: sp.name, color: sp.color, fixed: sp.fixed }); }
@@ -385,6 +397,7 @@ export function mount(root) {
   fParts.onchange = () => { const fs = [...fParts.files].filter(f => /\.(stl|3mf)$/i.test(f.name)); if (fs.length) addFiles(fs); else if (fParts.files.length) alert('Please pick .stl or .3mf files.'); fParts.value = ''; };
   fProj.onchange = () => { if (fProj.files[0]) loadProjectFile(fProj.files[0]); fProj.value = ''; };
   const actions = { open: () => fParts.click(), open2: () => fParts.click(), home: showStart, close: hideStart, save: saveProject, load: () => fProj.click(), addj: addJoint, sweep: runSweep, auto: () => runAuto(),
+    turnx: () => setView({ ...S.view, rx: S.view.rx + 1 }), turnz: () => setView({ ...S.view, rz: S.view.rz + 1 }),
     play: () => { S.playing = !S.playing; q('[data-a=play]').textContent = S.playing ? '⏸' : '▶'; } };
   app.addEventListener('click', (e) => { const a = e.target.closest('[data-a]')?.dataset.a; if (a && actions[a]) actions[a](); });
   q('[data-s=slider]').oninput = (e) => { S.t = e.target.value / 1000; update(); };
@@ -393,8 +406,9 @@ export function mount(root) {
   app.addEventListener('dragleave', () => drop.classList.remove('over'));
   app.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.remove('over'); const fs = [...e.dataTransfer.files].filter(f => /\.(stl|3mf)$/i.test(f.name)); if (fs.length) addFiles(fs); else if (e.dataTransfer.files[0]?.name.endsWith('.json')) loadProjectFile(e.dataTransfer.files[0]); });
 
+  setView({});
   // test hook (used by headless tests)
-  const api = { state: S, async addBuffer(name, buf) { await loadFile(name, buf); hideStart(); renderAll(); frame(); }, applyProject, setT, setTol, runSweep, listPresets, openPreset, frame, update, runAuto, stubAutoAssemble, poses: () => Object.fromEntries(S.parts.map(p => [p.id, p.mesh.matrix.toArray()])) };
+  const api = { state: S, async addBuffer(name, buf) { await loadFile(name, buf); hideStart(); renderAll(); frame(); }, applyProject, setT, setTol, runSweep, listPresets, openPreset, frame, update, runAuto, stubAutoAssemble, setView, world, poses: () => Object.fromEntries(S.parts.map(p => [p.id, p.mesh.matrix.toArray()])) };
   window.__mechTester = api;
   return api;
 }
