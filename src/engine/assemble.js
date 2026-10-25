@@ -154,6 +154,31 @@ const worldHoles = (P) => holesOf(P.G).map((h) => {
 
 // ---------- scoring ----------
 /** number of points (flat xyz array) that land in a set cell of grid G's array arr after transform m (inlined for speed). */
+// exact small through-holes of a mesh (any wall, any size of part), by ray parity on a 0.25 mm raster along each axis:
+// an empty spot fully enclosed by solid in the wall it pierces (the voxel grid is too coarse for 1.5-2 mm pivot holes).
+// Returns local {a, d, c (Vector3 hole centre, axis component = middle of the wall), lo, hi (wall extent along a)}.
+function rayHoles(g, dmax = 6) {
+  if (g._rayHoles) return g._rayHoles; g.computeBoundingBox(); const bb = g.boundingBox, bvh = g.boundsTree || (g.boundsTree = new MeshBVH(g)), R = Math.max(bb.max.x - bb.min.x, bb.max.y - bb.min.y, bb.max.z - bb.min.z) > 40 ? 0.3 : 0.2, J0 = 0.0137, out = []; // jitter: rays off the mesh grid (no edge hits)
+  for (let a = 0; a < 3; a++) { const [u, w] = [0, 1, 2].filter((k) => k !== a), u0 = bb.min.getComponent(u), w0 = bb.min.getComponent(w);
+    const nu = Math.ceil((bb.max.getComponent(u) - u0) / R), nw = Math.ceil((bb.max.getComponent(w) - w0) / R); if (nu * nw > 250000) continue;
+    const iv = new Array(nu * nw), ray = new THREE.Ray(), o = V(), d = V(); d.setComponent(a, 1);
+    for (let i = 0; i < nu; i++) for (let j = 0; j < nw; j++) { o.set(0, 0, 0); o.setComponent(u, u0 + (i + 0.5) * R + J0); o.setComponent(w, w0 + (j + 0.5) * R + J0); o.setComponent(a, bb.min.getComponent(a) - 1);
+      ray.set(o, d); const hs = bvh.raycast(ray, THREE.DoubleSide).map((h) => h.point.getComponent(a)).sort((x, y) => x - y), sv = []; for (let k = 0; k + 1 < hs.length; k += 2) sv.push([hs[k], hs[k + 1]]); iv[i * nw + j] = sv; }
+    const slabs = {}; for (const sv of iv) for (const [l, h] of sv) if (h - l > 0.6) { const k = Math.round(l) + ':' + Math.round(h); slabs[k] = (slabs[k] || 0) + 1; }
+    for (const k of Object.keys(slabs).filter((k) => slabs[k] * R * R > 3)) { const [l, h] = k.split(':').map(Number), m = 0.5 * (l + h), sol = iv.map((sv) => sv.some(([x, y]) => x <= m && y >= m)), seen = new Uint8Array(nu * nw);
+      for (let st = 0; st < nu * nw; st++) { if (sol[st] || seen[st]) continue; const q = [st], cells = []; seen[st] = 1; let enc = true;
+        while (q.length) { const c = q.pop(); cells.push(c); const i = Math.floor(c / nw), j = c % nw; if (i === 0 || j === 0 || i === nu - 1 || j === nw - 1) enc = false;
+          for (const [di, dj] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) { const ii = i + di, jj = j + dj; if (ii < 0 || jj < 0 || ii >= nu || jj >= nw) continue; const cc = ii * nw + jj; if (!sol[cc] && !seen[cc]) { seen[cc] = 1; q.push(cc); } } }
+        const A = cells.length * R * R, dd = 2 * Math.sqrt(A / Math.PI); if (!enc || dd > dmax || dd < 1) continue;
+        let su = 0, sw = 0, mu = [1e9, -1e9], mw = [1e9, -1e9]; for (const c of cells) { const i = Math.floor(c / nw), j = c % nw; su += i; sw += j; mu = [Math.min(mu[0], i), Math.max(mu[1], i)]; mw = [Math.min(mw[0], j), Math.max(mw[1], j)]; }
+        if ((mu[1] - mu[0] + 1) / (mw[1] - mw[0] + 1) > 1.5 || (mw[1] - mw[0] + 1) / (mu[1] - mu[0] + 1) > 1.5) continue; // round, not a slot
+        // the wall this hole pierces: the solid run along a around the hole's rim
+        const c = V(); c.setComponent(u, u0 + (su / cells.length + 0.5) * R); c.setComponent(w, w0 + (sw / cells.length + 0.5) * R);
+        let lo = l, hi = h; for (const cc of [cells[0] - nw, cells[0] + nw]) for (const [x, y] of iv[cc] || []) if (x <= m && y >= m) { lo = Math.max(lo, x); hi = Math.min(hi, y); }
+        c.setComponent(a, 0.5 * (lo + hi));
+        if (!out.some((e) => e.a === a && Math.abs(e.d - dd) < 0.5 && e.c.distanceTo(c) < 1 + Math.abs(e.c.getComponent(a) - c.getComponent(a)) && Math.abs(e.c.getComponent(a) - c.getComponent(a)) < 0.5 * (e.hi - e.lo + hi - lo))) out.push({ a, d: dd, c, lo, hi }); } } }
+  return (g._rayHoles = out);
+}
 function countIn(pts, m, G, arr) {
   const e = m.elements, ir = 1 / G.r, nx = G.nx, ny = G.ny, nz = G.nz, nxy = nx * ny;
   const a0 = e[0] * ir, a1 = e[4] * ir, a2 = e[8] * ir, a3 = (e[12] - G.o.x) * ir;
@@ -279,11 +304,11 @@ function refine(A, M, placed, axes = [0, 1, 2]) {
 }
 
 // ---------- motion probing ----------
-function travel(P, all, dirV, maxT, skip) {
-  const step = Math.max(P.G.r, 1); let t = 0;
+function travel(P, all, dirV, maxT, skip, tol = 0.01, st = 1) {
+  const step = Math.max(P.G.r, st); let t = 0;
   while (t + step <= maxT) {
     const M = new THREE.Matrix4().makeTranslation(dirV.x * (t + step), dirV.y * (t + step), dirV.z * (t + step)).multiply(P.M);
-    if (score(P, M, all, skip).of > 0.01) break; t += step;
+    if (score(P, M, all, skip).of > tol) break; t += step;
   }
   return t;
 }
@@ -301,12 +326,14 @@ function groupSwing(G, all, axis, o, sign, skip, T0, maxA = 60, step = 2, pa = 0
     if (!ok) break; sh = ok; a += step; }
   return { a, sh };
 }
-function swing(P, all, axis, origin, sign, skip, step = 2) {
-  let ang = 0;
-  while (ang < 90) {
+// swept collision check to the first contact: rotate in steps until the overlap rises above the starting overlap (parts
+// that already touch / press-fit at rest are not "blocked" by that), up to maxA degrees
+function swing(P, all, axis, origin, sign, skip, step = 2, maxA = 90) {
+  let ang = 0; const of0 = score(P, P.M, all, skip).of;
+  while (ang + step <= maxA) {
     const a = ang + step, R = new THREE.Matrix4().makeRotationAxis(axis, THREE.MathUtils.degToRad(sign * a));
     const M = new THREE.Matrix4().makeTranslation(origin.x, origin.y, origin.z).multiply(R).multiply(new THREE.Matrix4().makeTranslation(-origin.x, -origin.y, -origin.z)).multiply(P.M);
-    if (score(P, M, all, skip).of > 0.01) break; ang = a;
+    if (score(P, M, all, skip).of > of0 + 0.01) break; ang = a;
   }
   return ang;
 }
@@ -701,9 +728,229 @@ export async function autoAssemble(parts, opts = {}) {
     }
   }
 
+  // shell mating (general rule): two shells (each mostly one big open cavity) with similar footprints whose openings face
+  // each other along one axis stack at their rims: the largest planar rim faces (near the open ends, facing each other)
+  // are brought into contact, then the smaller shell is lifted off just enough to clear the other one (exact mesh test).
+  const bvhG = (g) => g.boundsTree || (g.boundsTree = new MeshBVH(g));
+  const rimPlane = (q, a, s, frac = 0.35) => { // world coordinate of the largest planar face with normal s·a in the outer frac of q along s,
+    // on the wall ring (outside the main cavity's cross-section: ledges inside the shell are not rims)
+    const cb = new THREE.Box3(q.G.cavities[0].min, q.G.cavities[0].max).applyMatrix4(q.M), [ru, rw] = [0, 1, 2].filter((k) => k !== a), ctr = V();
+    const pa = q.geometry.attributes.position, wb = worldBox(q), lo = wb.min.getComponent(a), hi = wb.max.getComponent(a), H = {}, v = [V(), V(), V()], n = V(), e1 = V(), e2 = V();
+    for (let i = 0; i + 2 < pa.count; i += 3) { for (let k = 0; k < 3; k++) v[k].fromBufferAttribute(pa, i + k).applyMatrix4(q.M);
+      n.crossVectors(e1.subVectors(v[1], v[0]), e2.subVectors(v[2], v[0])); const A = n.length() / 2; if (A < 1e-9) continue;
+      if (s * n.getComponent(a) / (2 * A) < 0.99) continue; const c = (v[0].getComponent(a) + v[1].getComponent(a) + v[2].getComponent(a)) / 3;
+      if (s > 0 ? c < hi - frac * (hi - lo) : c > lo + frac * (hi - lo)) continue;
+      ctr.copy(v[0]).add(v[1]).add(v[2]).divideScalar(3); if ([ru, rw].every((k) => ctr.getComponent(k) > cb.min.getComponent(k) + 0.5 && ctr.getComponent(k) < cb.max.getComponent(k) - 0.5)) continue; const key = Math.round(c * 5) / 5; H[key] = (H[key] || 0) + A; }
+    const best = Object.entries(H).sort((x, y) => y[1] - x[1])[0]; return best ? { c: +best[0], area: best[1] } : null; };
+  const shellOf = (q, M = q.M) => { const cv = q.G.cavities[0]; if (!cv || cv.open.length !== 1) return null; const bs = q.G.bb.getSize(V());
+    // compartments opening the same way count together (a tray split by inner walls is still one shell)
+    const vol = q.G.cavities.filter((c) => c.open.length === 1 && c.open[0].a === cv.open[0].a && c.open[0].s === cv.open[0].s).reduce((t, c) => { const cs = c.max.clone().sub(c.min); return t + cs.x * cs.y * cs.z; }, 0);
+    return vol > 0.3 * bs.x * bs.y * bs.z ? worldAxis(M, cv.open[0]) : null; };
+  if (!inPlace && opts.rimMate !== false) {
+    const baseInvR = base.given ? base.given.clone().invert() : new THREE.Matrix4();
+    for (const S2 of P) { if (S2 === base || S2.unmatched || LK?.ids.has(S2.id)) continue; if (!shellOf(S2)) continue; const M0 = S2.M, r0 = reasons[S2.id];
+      for (const S1 of byVol) { if (S1 === S2 || S1.G.volume < S2.G.volume * 0.5 || S1.unmatched) continue; const o1 = shellOf(S1); if (!o1) continue;
+        // if the search turned S2 so its opening no longer lines up with S1's, fall back to its as-given orientation
+        S2.M = M0; reasons[S2.id] = r0; let o2 = shellOf(S2); if (o2.a !== o1.a && S2.given && !plate) { const Mg = baseInvR.clone().multiply(S2.given), og = shellOf(S2, Mg); if (og && og.a === o1.a) { S2.M = Mg; o2 = og; reasons[S2.id] += '; kept as given (opening lines up with ' + S1.id + ')'; } }
+        if (o2.a !== o1.a) continue; const a = o1.a, b1 = worldBox(S1), b2 = worldBox(S2), [u, w] = [0, 1, 2].filter((k) => k !== a);
+        const ov = (k) => Math.max(0, Math.min(b1.max.getComponent(k), b2.max.getComponent(k)) - Math.max(b1.min.getComponent(k), b2.min.getComponent(k)));
+        const fp = (bx) => bx.getSize(V()).getComponent(u) * bx.getSize(V()).getComponent(w); if (ov(u) * ov(w) < 0.8 * Math.min(fp(b1), fp(b2))) continue;
+        // s1 = direction from S1 towards S2; at least one of the two facing ends must be an open rim (rim-to-rim, or a
+        // closed floor stacked onto an open rim, e.g. a hopper standing on a tray)
+        const s1 = Math.sign(b2.getCenter(V()).getComponent(a) - b1.getCenter(V()).getComponent(a)) || 1; if (o1.s !== s1 && o2.s !== -s1) continue;
+        // floor-on-rim stacking (openings the same way) only for equal footprints (±15%), never a part nested inside the other
+        if (o1.s === o2.s) { const z1 = b1.getSize(V()), z2 = b2.getSize(V()); if ([u, w].some((k) => Math.abs(z1.getComponent(k) - z2.getComponent(k)) > 0.15 * Math.max(z1.getComponent(k), z2.getComponent(k)))) continue; }
+        const r1 = rimPlane(S1, a, s1), r2 = rimPlane(S2, a, -s1); if (!r1 || !r2) continue;
+        let d = r1.c - r2.c; if (Math.abs(d) > 0.6 * b2.getSize(V()).getComponent(a)) continue;
+        const T = (x) => { const t = V(); t.setComponent(a, x); return new THREE.Matrix4().makeTranslation(t.x, t.y, t.z).multiply(S2.M); };
+        const hit = (M) => bvhG(S1.geometry).intersectsGeometry(S2.geometry, S1.M.clone().invert().multiply(M)) && (bvhG(S2.geometry), true);
+        bvhG(S2.geometry); let lift = 0; while (lift < 3 && hit(T(d + s1 * lift))) lift += 0.25;
+        if (lift >= 3 && hit(T(d + s1 * lift))) continue;
+        const moved = d + s1 * lift; if (Math.abs(moved) > 1e-3) {
+          // fasteners riding on S2 (touching S2 but not S1, e.g. hinge pins in its knuckles) move with it
+          const ride = P.filter((q) => q !== S2 && q !== S1 && q !== base && !q.unmatched && maxDim(q) < 25 && (() => { const sc = score(q, q.M, [S1, S2]).perOther; return (sc[S2.id]?.c || 0) > 0 && !(sc[S1.id]?.c); })());
+          const dT = T(moved).multiply(S2.M.clone().invert()); S2.M = T(moved); for (const q of ride) { q.M = dT.clone().multiply(q.M); reasons[q.id] += `; moved with ${S2.id} (shell mating)`; }
+          reasons[S2.id] += `; shell mating: rim at ${AX[a]} ${r2.c.toFixed(1)} (${r2.area.toFixed(0)} mm²) onto the rim of ${S1.id} at ${r1.c.toFixed(1)}${lift ? `, lifted ${lift} mm to clear it` : ''} (moved ${moved.toFixed(2)} mm along ${AX[a]})`; }
+        S2.rimOn = { id: S1.id, a, s: s1 }; break; }
+      if (!S2.rimOn) { S2.M = M0; reasons[S2.id] = r0; } } // the as-given fallback only stands if it mated
+  }
+
+  // sleeves on pins (general rule): a small part with a round hole sized for a placed pin's shaft (a hinge knuckle such
+  // as a latch/closure, or an end cap) is threaded onto that pin: hole coaxial with the pin, slid along the pin to the
+  // free gap where it overlaps nothing and touches most (knuckle gap between two lugs, or the bare pin end).
+  const sleeveOn = {};
+  if (!inPlace && opts.sleeves !== false) {
+    const pins = P.filter((q) => !q.unmatched && pinAxis(q) && !holesOf(q.G).some((h) => h.d > 1)), minor = (q) => Math.min(...worldBox(q).getSize(V()).toArray());
+    const sleeveHole = (q) => { if (q === base || pins.includes(q) || maxDim(q) >= 25 || LK?.ids.has(q.id)) return null;
+      const sz = q.G.bb.getSize(V()).toArray(), long = sz.indexOf(Math.max(...sz)), elong = Math.max(...sz) > 1.8 * Math.min(...sz);
+      return holesOf(q.G).filter((h) => !elong || h.a !== long).map((h) => refineHole(q.geometry, h)).sort((x, y) => y.d - x.d)[0] || null; };
+    const sl = P.map((q) => ({ q, h: sleeveHole(q) })).map((x) => (x.h && bvhG(x.q.geometry), x)).filter((x) => x.h && pins.length).sort((x, y) => y.q.G.volume - x.q.G.volume);
+    const slIds = new Set(sl.map((x) => x.q.id)), fixed = P.filter((q) => !slIds.has(q.id) && !q.unmatched);
+    const radial = (Q) => Q._rad || (Q._rad = (() => { const pa = pinAxis(Q), c = pa.center, [u, w] = [0, 1, 2].filter((k) => k !== pa.a), p = Q.geometry.attributes.position, v = V(), out = [];
+      for (let i = 0; i < p.count; i++) { v.fromBufferAttribute(p, i).applyMatrix4(Q.M); out.push([v.getComponent(pa.a), Math.hypot(v.getComponent(u) - c.getComponent(u), v.getComponent(w) - c.getComponent(w))]); } return out; })());
+    for (const { q, h } of sl) {
+      let best = null;
+      for (const Q of pins) { const pa = pinAxis(Q), a = pa.a, m = minor(Q); if (h.d < m - 1.2 || h.d > m + 0.3) continue;
+        const wb = worldBox(Q), lo = wb.min.getComponent(a), hi = wb.max.getComponent(a);
+        for (const R of ROTATIONS_24) { if (worldAxis(R, { a: h.a, s: 1 }).a !== a) continue;
+          const hc = h.center.clone().applyMatrix4(R), hl = Math.abs(h.ahi - h.alo) / 2;
+          for (let t = lo + 1 - hl; t <= hi - 1 + hl + 1e-6; t += 0.25) { // ≥ 1 mm of pin engaged in the hole
+            const tgt = pa.center.clone(); tgt.setComponent(a, t); const M = new THREE.Matrix4().makeTranslation(tgt.x - hc.x, tgt.y - hc.y, tgt.z - hc.z).multiply(R);
+            const s = score(q, M, fixed); const v = s.cf; if (best && v <= best.v + 1e-9) continue;
+            // exact test: the sleeve must clear every part (its hole clears the pin shaft; it cannot sit over a pin head)
+            const sb = worldBox({ G: q.G, M }), slo = sb.min.getComponent(a) + 0.05, shi = sb.max.getComponent(a) - 0.05;
+            const hlo = t - hl - 0.05, hhi = t + hl + 0.05; // hole span; outside it (blind end / solid part of the sleeve) the pin must not reach
+            if (radial(Q).some(([x, r]) => x > slo && x < shi && (r > h.d / 2 + 0.15 || x < hlo || x > hhi))) continue; // pin too fat here (head / collar) or hits the blind end
+            if (fixed.some((o) => o !== Q && worldBox(o).intersectsBox(worldBox({ G: q.G, M })) && bvhG(o.geometry).intersectsGeometry(q.geometry, o.M.clone().invert().multiply(M)))) continue;
+            if (!best || v > best.v + 1e-9) best = { v, M, Q, t, s }; } } }
+      if (!best) continue;
+      q.M = best.M; fixed.push(q); const span = worldBox(q).getSize(V()).getComponent(pinAxis(best.Q).a), through = Math.abs(h.ahi - h.alo) >= 0.9 * span;
+      // a through-hole knuckle on a longer arm (latch, link) turns on the pin; a blind cap is a press-fit retainer
+      sleeveOn[q.id] = { pin: best.Q.id, a: pinAxis(best.Q).a, center: pinAxis(best.Q).center.clone(), turns: through && maxDim(q) > 2.5 * h.d };
+      reasons[q.id] += `; sleeve on pin: hole Ø${h.d.toFixed(2)} threaded onto ${best.Q.id} (Ø${minor(best.Q).toFixed(1)}) along ${AX[pinAxis(best.Q).a]} at ${best.t.toFixed(1)}, contact ${(best.s.cf * 100).toFixed(0)}%, no mesh intersection`;
+    }
+  }
+
+  // drawer seating (general rule): a box-shaped part with its own opening, sitting in a housing cavity that is open along
+  // one axis. Out-direction = the housing end without a wall (least material across the cavity cross-section); the
+  // drawer's front (end with more material: front wall / handle) faces out; depth = slide in to the first contact (back
+  // stop / front panel), or front-flush with the housing's open face when nothing stops it.
+  const drawerSeat = {};
+  if (!inPlace && opts.drawerSeat !== false) {
+    const keptSet = new Set(keep.kept.map((q) => q.id));
+    const wpts = (q, M = q.M) => { const out = [], v = V(); for (const arr of [q.G.corePts, q.G.surfPts]) for (let i = 0; i < arr.length; i += 3) out.push(v.set(arr[i], arr[i + 1], arr[i + 2]).clone().applyMatrix4(M)); return out; };
+    for (const p of P) {
+      if (p === base || keptSet.has(p.id) || p.unmatched || LK?.ids.has(p.id) || pinAxis(p) || rodOf(p.G) || !p.G.cavities.length) continue;
+      const wb = worldBox(p), c = wb.getCenter(V()), sz = wb.getSize(V());
+      for (const H of P) {
+        if (H === p || H.G.volume < p.G.volume || (H !== base && !keptSet.has(H.id) && H.unmatched)) continue;
+        const cav = H.G.cavities.map((cv) => ({ cv, cb: new THREE.Box3(cv.min, cv.max).applyMatrix4(H.M) })).find(({ cb }) => cb.clone().expandByScalar(1).containsPoint(c)); if (!cav) continue;
+        const opens = cav.cv.open.map((d) => worldAxis(H.M, d)); if (!opens.length) continue;
+        // drawer's own opening must not face along the slide axis (it is a tray, not a sleeve): slide axis = an open axis of
+        // the housing cavity other than the drawer's opening axis
+        const po = worldAxis(p.M, p.G.cavities[0].open[0] || { a: 2, s: 1 }), oa = opens.find((d) => d.a !== po.a); if (!oa) continue; const a = oa.a;
+        const [b, e] = [0, 1, 2].filter((q) => q !== a), cs = cav.cb.getSize(V());
+        if (sz.getComponent(b) < 0.6 * cs.getComponent(b) || sz.getComponent(e) < 0.6 * cs.getComponent(e)) continue;
+        const hb = worldBox(H), hp = wpts(H), inX = (v) => [b, e].every((k) => v.getComponent(k) > cav.cb.min.getComponent(k) + 1 && v.getComponent(k) < cav.cb.max.getComponent(k) - 1);
+        const endMat = (s) => { const F = s > 0 ? hb.max.getComponent(a) : hb.min.getComponent(a); return hp.filter((v) => inX(v) && Math.abs(v.getComponent(a) - F) < 4).length; };
+        const sOut = [1, -1].sort((x, y) => endMat(x) - endMat(y))[0];
+        if (!opens.some((d) => d.a === a && d.s === sOut) && endMat(sOut) > 0) continue;
+        // front of the drawer = end whose outermost ~2 mm layer is a handle / tab sticking out (much less material than the
+        // flat full-width wall at the back); a tie keeps the searched orientation
+        const L = sz.getComponent(a), la = worldAxis(p.M.clone().invert(), { a, s: 1 }), Gp = p.G, dims = [Gp.nx, Gp.ny, Gp.nz], perL = new Float64Array(dims[la.a]);
+        for (let z = 0; z < Gp.nz; z++) for (let y = 0; y < Gp.ny; y++) for (let x = 0; x < Gp.nx; x++) if (Gp.occ[x + Gp.nx * (y + Gp.ny * z)]) perL[[x, y, z][la.a]]++;
+        const nL = Math.max(1, Math.round(2 / Gp.r)), sumEnd = (hi) => { const at = (k) => perL[hi ? dims[la.a] - 1 - k : k]; let k0 = 0; while (k0 < dims[la.a] && !at(k0)) k0++; let n = 0; for (let k = k0; k < k0 + nL && k < dims[la.a]; k++) n += at(k); return n; };
+        const slab = (s) => sumEnd((s * la.s) > 0); // world end s -> local end
+        const flip = slab(-sOut) < 0.6 * slab(sOut);
+        // already seated (front toward the open face, no mesh intersection with the housing): keep the placement
+        if (!flip && !bvhG(H.geometry).intersectsGeometry(bvhG(p.geometry) && p.geometry, H.M.clone().invert().multiply(p.M))) break;
+        let M = p.M.clone();
+        if (flip) { const ax = V(); ax.setComponent(po.a, 1);
+          M = new THREE.Matrix4().makeTranslation(c.x, c.y, c.z).multiply(new THREE.Matrix4().makeRotationAxis(ax, Math.PI)).multiply(new THREE.Matrix4().makeTranslation(-c.x, -c.y, -c.z)).multiply(M); }
+        // start just outside the open face, slide in until first contact with the housing
+        // centre across the cavity (the axis that is neither the slide axis nor the drawer's opening)
+        { const w = [b, e].find((k) => k !== po.a); if (w !== undefined) { const pbw = p.G.bb.clone().applyMatrix4(M), dc = V();
+          dc.setComponent(w, (cav.cb.min.getComponent(w) + cav.cb.max.getComponent(w) - pbw.min.getComponent(w) - pbw.max.getComponent(w)) / 2);
+          if (Math.abs(dc.getComponent(w)) < 2) M = new THREE.Matrix4().makeTranslation(dc.x, dc.y, dc.z).multiply(M); } }
+        const F = sOut > 0 ? hb.max.getComponent(a) : hb.min.getComponent(a), pb = p.G.bb.clone().applyMatrix4(M);
+        const backFace = sOut > 0 ? pb.min.getComponent(a) : pb.max.getComponent(a), d0 = V(); d0.setComponent(a, F - backFace + sOut * (clearance + 0.5));
+        const save = p.M; p.M = new THREE.Matrix4().makeTranslation(d0.x, d0.y, d0.z).multiply(M);
+        const din = V(); din.setComponent(a, -sOut);
+        const onlyH = new Set(P.filter((q) => q !== H).map((q) => q.id)), maxT = L + hb.getSize(V()).getComponent(a);
+        // leading face only (the drawer's back slab, away from its sliding side faces): grazing the rails does not count
+        const Ml = p.M.clone(), pb2 = p.G.bb.clone().applyMatrix4(Ml), lead = sOut > 0 ? pb2.min.getComponent(a) : pb2.max.getComponent(a), Mi = Ml.clone().invert(), lp = [];
+        const pa0 = p.geometry.attributes.position, mesh = []; for (let i = 0; i < pa0.count; i++) mesh.push(V().fromBufferAttribute(pa0, i).applyMatrix4(Ml));
+        for (let i = 0; i + 2 < pa0.count; i += 3) mesh.push(mesh[i].clone().add(mesh[i + 1]).add(mesh[i + 2]).divideScalar(3));
+        for (const v of mesh) if (Math.abs(v.getComponent(a) - lead) < 2.5 && [b, e].every((k) => v.getComponent(k) > pb2.min.getComponent(k) + 0.6 && v.getComponent(k) < pb2.max.getComponent(k) - 0.6)) lp.push(...v.applyMatrix4(Mi).toArray());
+        const lpa = new Float32Array(lp), hitN = (Mx) => countIn(lpa, H.M.clone().invert().multiply(Mx), H.G, H.G.occ);
+        const n0 = hitN(p.M); let t = 0; for (; t + 0.5 <= maxT; t += 0.5) { const T = din.clone().multiplyScalar(t + 0.5); if (hitN(new THREE.Matrix4().makeTranslation(T.x, T.y, T.z).multiply(p.M)) > n0 + 3) break; }
+        let how = 'back stop / first contact';
+        const flushT = L + clearance + 0.5; // front face flush with the housing's open face
+        if (t >= maxT - 2 || t < 0.3 * L) { t = flushT; how = 'front-flush with the open face'; }
+        const d1 = din.clone().multiplyScalar(t); p.M = new THREE.Matrix4().makeTranslation(d1.x, d1.y, d1.z).multiply(p.M);
+        // exact mesh check: back off (out along the slide axis, ≤ 3 mm) until it no longer touches the stop
+        { const bvh = H.geometry.boundsTree || (H.geometry.boundsTree = new MeshBVH(H.geometry)), dout = din.clone().negate();
+          for (let k = 0; k < 12 && bvh.intersectsGeometry(p.geometry, H.M.clone().invert().multiply(p.M)); k++) p.M = new THREE.Matrix4().makeTranslation(dout.x * 0.25, dout.y * 0.25, dout.z * 0.25).multiply(p.M); }
+        if (score(p, p.M, P.filter((q) => q !== p)).of > 0.03) { p.M = save; continue; }
+        drawerSeat[p.id] = { a, s: sOut, H: H.id };
+        reasons[p.id] += `; drawer seating: ${H.id} is open toward ${sOut > 0 ? '+' : '−'}${AX[a]}, front ${flip ? 'turned to face' : 'faces'} out, inserted to the ${how}`;
+        break;
+      }
+    }
+  }
+
   for (const p of P) {
     const s = score(p, p.M, P.filter((q) => q !== p));
     p.matedTo = Object.entries(s.perOther).sort((a, b) => b[1].c - a[1].c).find(([, v]) => v.c > 0)?.[0] ?? null;
+  }
+  // exact mesh check of a swept hinge range (the sampled grid misses thin latches/rims): back off to the last clear angle
+  const exactSwing = (p, axis, origin, sk, plus, minus) => {
+    const pa = { center: origin };
+      const others = P.filter((o) => o !== p && !sk.has(o.id)), rotM = (ang) => { const o = pa.center; return new THREE.Matrix4().makeTranslation(o.x, o.y, o.z).multiply(new THREE.Matrix4().makeRotationAxis(axis, THREE.MathUtils.degToRad(ang))).multiply(new THREE.Matrix4().makeTranslation(-o.x, -o.y, -o.z)).multiply(p.M); };
+      const hitAt = (M, list) => list.filter((o) => worldBox(o).intersectsBox(worldBox({ G: p.G, M })) && bvhG(o.geometry).intersectsGeometry(bvhG(p.geometry) && p.geometry, o.M.clone().invert().multiply(M)));
+      const base0 = new Set(hitAt(p.M, others).map((o) => o.id)), chk = others.filter((o) => !base0.has(o.id));
+      // parts already touching at rest (knuckles, latches): mesh vertices sunk into each other's voxels must not grow
+      const vtx = (q) => q._vtx || (q._vtx = (() => { const pa2 = q.geometry.attributes.position, st = Math.max(1, Math.floor(pa2.count / 6000)), out = []; for (let i = 0; i < pa2.count; i += st) out.push(pa2.getX(i), pa2.getY(i), pa2.getZ(i)); return out; })());
+      const sunk = (M, o) => countIn(vtx(p), o.M.clone().invert().multiply(M), o.G, o.G.occ) + countIn(vtx(o), M.clone().invert().multiply(o.M), p.G, p.G.occ);
+      const touch = others.filter((o) => base0.has(o.id)).map((o) => ({ o, d0: sunk(p.M, o), tol: Math.max(10, 0.01 * (vtx(p).length + vtx(o).length) / 3) }));
+      const exact = (sg, a) => { for (let x = 2; x <= a; x += 2) { const M = rotM(sg * x); if (hitAt(M, chk).length || touch.some(({ o, d0, tol }) => sunk(M, o) > d0 + tol)) return x - 2; } return a; };
+      return [exact(1, plus), exact(-1, minus)]; };
+  // latches (turning sleeves) rest closed: swing to the end of their free range where they touch the other shell most
+  for (const p of P) { const so = sleeveOn[p.id]; if (!so?.turns) continue;
+    const axis = V(), sk = new Set([so.pin]); axis.setComponent(so.a, 1);
+    const pl = swing(p, P, axis, so.center, 1, sk, 2, 180), mi = swing(p, P, axis, so.center, -1, sk, 2, 180), [ep, em] = exactSwing(p, axis, so.center, sk, pl, mi);
+    const rotM = (ang) => { const o = so.center; return new THREE.Matrix4().makeTranslation(o.x, o.y, o.z).multiply(new THREE.Matrix4().makeRotationAxis(axis, THREE.MathUtils.degToRad(ang))).multiply(new THREE.Matrix4().makeTranslation(-o.x, -o.y, -o.z)).multiply(p.M); };
+    const pin = P.find((o) => o.id === so.pin), po0 = score(p, p.M, P.filter((o) => o !== p && o !== pin)).perOther, hold = Object.entries(po0).sort((x, y) => y[1].c - x[1].c)[0]?.[0];
+    const others = P.filter((o) => o !== p && o !== pin && o.id !== hold), cont = (M) => score(p, M, others).cf; // contact with the other shell (not the knuckle holder)
+    const ends = [[0, cont(p.M)], [ep, cont(rotM(ep))], [-em, cont(rotM(-em))]].sort((x, y) => y[1] - x[1]);
+    if (ends[0][0] && ends[0][1] > ends.find((e) => e[0] === 0)[1] + 0.05) { p.M = rotM(ends[0][0]); reasons[p.id] += `; latch rests closed: turned ${ends[0][0]}° on ${so.pin} to its first contact (contact ${(ends[0][1] * 100).toFixed(0)}%)`; }
+  }
+  // lever pivots (general rule): an elongated part (arm/lever) with a small round pivot hole and no pin through it, left
+  // overlapping or detached by the search, is hung on a matching hole (same diameter ±0.4 mm, e.g. for a filament or
+  // printed pin) of a bigger placed part: hole axes made coaxial (24 orientations in 30° steps about the axis), slid along the
+  // axis to the spot that touches most with no mesh intersection; it then hinges about that axis (see joint inference)
+  const pivotOn = {};
+  if (!inPlace && opts.pivots !== false) {
+    const pinThrough = (p) => P.some((q) => q !== p && pinAxis(q) && worldBox(p).clone().expandByScalar(1).containsPoint(pinAxis(q).center));
+    const hitsAny = (p, M, list) => list.some((o) => worldBox(o).intersectsBox(worldBox({ G: p.G, M })) && bvhG(o.geometry).intersectsGeometry(bvhG(p.geometry) && p.geometry, o.M.clone().invert().multiply(M)));
+    const levers = P.filter((p) => { if (p === base || p.unmatched || LK?.ids.has(p.id) || sleeveOn[p.id] || p.rimOn || maxDim(p) > 80) return false;
+      const z = p.G.bb.getSize(V()).toArray().sort((x, y) => y - x); if (z[0] < 2.5 * z[1]) return false; if (pinThrough(p)) return false;
+      const bad = hitsAny(p, p.M, P.filter((o) => o !== p)) || !worldBox(p).intersectsBox(worldBox(base).expandByScalar(0.5)); if (!bad) return false;
+      // a rod-like part counts as a lever (not a pin) when it has a pivot hole across its length
+      const long = [0, 1, 2].sort((x, y) => p.G.bb.getSize(V()).getComponent(y) - p.G.bb.getSize(V()).getComponent(x))[0];
+      return rayHoles(p.geometry).some((h) => h.a !== long); }).sort((x, y) => y.G.volume - x.G.volume);
+    const pending = new Set(levers.map((p) => p.id));
+    for (const p of levers) { pending.delete(p.id); const fixed = P.filter((o) => o !== p && !pending.has(o.id) && !o.unmatched);
+      const targets = []; for (const T of fixed) { if (T.G.volume < p.G.volume || maxDim(T) > 300) continue;
+        for (const h of rayHoles(T.geometry)) { const ax = V(); ax.setComponent(h.a, 1); ax.transformDirection(T.M); const wa = [0, 1, 2].find((k) => Math.abs(ax.getComponent(k)) > 0.9);
+          const c = h.c.clone().applyMatrix4(T.M), e1 = h.c.clone(), e2 = h.c.clone(); e1.setComponent(h.a, h.lo); e2.setComponent(h.a, h.hi); e1.applyMatrix4(T.M); e2.applyMatrix4(T.M);
+          targets.push({ T, a: wa, d: h.d, c, lo: Math.min(e1.getComponent(wa), e2.getComponent(wa)), hi: Math.max(e1.getComponent(wa), e2.getComponent(wa)) }); } }
+      // pivots go onto the base and the parts stacked on it first (the frame), other moving parts only if none fits
+      const frame = (T) => !!(T === base || T.rimOn?.id === base.id || (base.rimOn && base.rimOn.id === T.id));
+      let best = null;
+      for (const pass of [0, 1]) { if (best) break;
+      for (const hL of rayHoles(p.geometry).filter((h) => h.a !== [0, 1, 2].sort((x, y) => p.G.bb.getSize(V()).getComponent(y) - p.G.bb.getSize(V()).getComponent(x))[0])) for (const tg of targets) { if (Math.abs(hL.d - tg.d) > 0.4 || frame(tg.T) !== (pass === 0)) continue; const hl = 0.5 * (hL.hi - hL.lo);
+        const ax = V(); ax.setComponent(tg.a, 1);
+        for (const R0 of ROTATIONS_24) { const la = V(); la.setComponent(hL.a, 1); la.applyMatrix4(R0); if (Math.abs(la.getComponent(tg.a)) < 0.9) continue;
+          for (const th of [0, 30, 60]) { const R = new THREE.Matrix4().makeRotationAxis(ax, THREE.MathUtils.degToRad(th)).multiply(R0), c0 = hL.c.clone().applyMatrix4(R);
+            for (let t = tg.lo - hl - 3; t <= tg.hi + hl + 3; t += 0.5) { const tr = tg.c.clone().sub(c0); tr.setComponent(tg.a, t - c0.getComponent(tg.a));
+              const M = new THREE.Matrix4().makeTranslation(tr.x, tr.y, tr.z).multiply(R), sc = score(p, M, fixed); if (sc.of > 0.002) continue;
+              // the pivot must actually span the pin line: lever hole next to / inside the target hole's wall
+              const gap = Math.max(0, tg.lo - (t + hl), (t - hl) - tg.hi); const val = sc.cf - 0.05 * gap;
+              if (!best || val > best.val) { if (hitsAny(p, M, fixed)) continue; best = { val, M, tg, hL, t, th, gap, cf: sc.cf }; } } } } } }
+      if (!best) continue; p.M = best.M; const ctr = best.tg.c.clone(); ctr.setComponent(best.tg.a, best.t);
+      pivotOn[p.id] = { a: best.tg.a, center: ctr, onto: best.tg.T.id, d: best.hL.d, dT: best.tg.d };
+      reasons[p.id] += `; pivot: its ⌀${best.hL.d.toFixed(1)} hole hung coaxial on the ⌀${best.tg.d.toFixed(1)} hole of ${best.tg.T.id} (${AX[best.tg.a]} axis at [${ctr.toArray().map((v) => +v.toFixed(1))}]), no mesh intersection, contact ${(best.cf * 100).toFixed(0)}%`; }
+  }
+  // exact clearance (general rule): a placed part whose mesh still cuts into a neighbour by a sliver the voxel score misses
+  // (thin hooks/ribs) is nudged out by the smallest axis step (0.25 mm up to 1.5 mm) that clears every mesh
+  if (!inPlace && opts.nudge !== false) {
+    const hitL = (p, M) => P.filter((o) => o !== p && !o.unmatched && worldBox(o).intersectsBox(worldBox({ G: p.G, M })) && bvhG(o.geometry).intersectsGeometry(bvhG(p.geometry) && p.geometry, o.M.clone().invert().multiply(M)));
+    for (const p of P) { if (p === base || p.unmatched || LK?.ids.has(p.id) || sleeveOn[p.id] || pivotOn[p.id] || pinAxis(p) || maxDim(p) < 12 || P.some((o) => sleeveOn[o.id]?.pin === p.id)) continue;
+      const h0 = hitL(p, p.M); if (!h0.length || h0.some((o) => pinAxis(o) || maxDim(o) < 12)) continue; let done = false;
+      for (let st = 0.25; st <= 1.5 && !done; st += 0.25) for (let a = 0; a < 3 && !done; a++) for (const sg of [1, -1]) { const t = V(); t.setComponent(a, sg * st);
+        const M = new THREE.Matrix4().makeTranslation(t.x, t.y, t.z).multiply(p.M); if (hitL(p, M).length) continue;
+        p.M = M; done = true; reasons[p.id] += `; nudged ${st} mm along ${sg > 0 ? '+' : '−'}${AX[a]} to clear ${h0.map((o) => o.id).join('/')} (exact mesh test)`; break; } }
   }
   // joint inference
   const J = {};
@@ -711,7 +958,7 @@ export async function autoAssemble(parts, opts = {}) {
   let k2 = 0; const pinParent = {};
   for (const p of P) {
     if (p !== base && LK?.ids.has(p.id)) { J[p.id] = { type: 'fixed', confidence: 0.5, reason: 'linkage' }; continue; }
-    if (p !== base && p.matedTo && (pinAxis(p) || (p.G.volume < 0.01 * base.G.volume && Math.max(...worldBox(p).getSize(V()).toArray()) < 12))) { J[p.id] = { type: 'fixed', confidence: 0.5, reason: `pin/fastener-sized part seated in ${p.matedTo}` }; continue; }
+    if (p !== base && p.matedTo && !sleeveOn[p.id]?.turns && (pinAxis(p) || (p.G.volume < 0.01 * base.G.volume && Math.max(...worldBox(p).getSize(V()).toArray()) < 12))) { J[p.id] = { type: 'fixed', confidence: 0.5, reason: `pin/fastener-sized part seated in ${p.matedTo}` }; continue; }
     if (p === base || p.unmatched) { J[p.id] = { type: 'fixed', confidence: p === base ? 1 : 0, reason: p === base ? 'base' : 'unmatched' }; continue; }
     const skip = childrenOf(p), wb = worldBox(p), size = wb.getSize(V());
     const mate = P.find((q) => q.id === p.matedTo);
@@ -741,19 +988,26 @@ export async function autoAssemble(parts, opts = {}) {
     // hinge (checked first) about a pin passing through this part
     let hinge = null;
     for (const q of P) {
-      if (q === p || q === base) continue; const pa = pinAxis(q); if (!pa) continue;
+      if (q === p || q === base || pivotOn[q.id]) continue; const pa = pinAxis(q); if (!pa) continue; // a lever on its pivot is not a pin
+      if (sleeveOn[p.id] && sleeveOn[p.id].pin !== q.id) continue; // a sleeve turns about the pin it is threaded on
       const sc = score(q, q.M, [p]); if (!sc.perOther[p.id] || sc.perOther[p.id].c < 3) continue;
       if (!wb.containsPoint(pa.center) && !wb.clone().expandByScalar(2).containsPoint(pa.center)) continue;
-      const axis = V(); axis.setComponent(pa.a, 1); const sk = new Set([...skip, q.id]);
-      let plus = swing(p, P, axis, pa.center, 1, sk), minus = swing(p, P, axis, pa.center, -1, sk), drv = '';
+      // parts riding on p (other pins in its knuckles and the sleeves/caps on them) turn with it; sleeves on q stay
+      const riders = sleeveOn[p.id] ? [] : P.filter((o) => o !== q && o !== p && o !== base && pinAxis(o) && maxDim(o) < 25 && wb.containsPoint(pinAxis(o).center)).map((o) => o.id);
+      for (const id of [...riders]) for (const [sid, so] of Object.entries(sleeveOn)) if (so.pin === id && !riders.includes(sid)) riders.push(sid);
+      for (const [sid, so] of Object.entries(sleeveOn)) if (so.pin === q.id && riders.includes(sid)) riders.splice(riders.indexOf(sid), 1);
+      const axis = V(); axis.setComponent(pa.a, 1); const sk = new Set([...[...skip].filter((id) => !(sleeveOn[id]?.turns && sleeveOn[id].pin === q.id)), q.id, ...riders]), big = Object.keys(sleeveOn).length ? 180 : 90;
+      // sample both directions up to big degrees (first contact)
+      let plus = swing(p, P, axis, pa.center, 1, sk, 2, big), minus = swing(p, P, axis, pa.center, -1, sk, 2, big), drv = '';
+      if (big > 90) [plus, minus] = exactSwing(p, axis, pa.center, sk, plus, minus);
       if (Math.max(plus, minus) < 6) { // blocked by a push rod/button that drives it: swing ignoring rods
-        const rods = P.filter((r2) => r2 !== p && r2 !== base && rodOf(r2.G)).map((r2) => r2.id);
+        const rods = P.filter((r2) => r2 !== p && r2 !== q && r2 !== base && !riders.includes(r2.id) && !sleeveOn[r2.id] && rodOf(r2.G)).map((r2) => r2.id);
         if (rods.length) { const sk2 = new Set([...sk, ...rods]); plus = swing(p, P, axis, pa.center, 1, sk2); minus = swing(p, P, axis, pa.center, -1, sk2); drv = ` (driven by ${rods.join('/')})`; }
       }
       // driven by a push rod (button): press the rod to its stop and find the smallest swing (either way) that clears it,
       // without hitting the base -> that is the lever's travel to its first contact and the direction the rod drives it
       let drivenBy = null;
-      for (const r2 of P) { if (r2 === p || r2 === base || r2 === q || !rodOf(r2.G)) continue; const s2 = score(r2, r2.M, [p]); if (!worldBox(r2).expandByScalar(1).intersectsBox(wb)) continue;
+      for (const r2 of P) { if (r2 === p || r2 === base || r2 === q || riders.includes(r2.id) || sleeveOn[r2.id] || !rodOf(r2.G)) continue; const s2 = score(r2, r2.M, [p]); if (!worldBox(r2).expandByScalar(1).intersectsBox(wb)) continue;
         const rb = worldBox(r2), c = worldBox(base).getCenter(V()).sub(rb.getCenter(V())), sz = rb.getSize(V()).toArray(), ra = sz.indexOf(Math.max(...sz));
         const d = V(); d.setComponent(ra, Math.sign(c.getComponent(ra)) || 1); const ext = sz[ra];
         const t = Math.min(travel(r2, P, d, ext * 1.2 + 2, new Set(P.filter((o) => o !== base).map((o) => o.id))), 5, 0.25 * ext); if (t < 1) continue;
@@ -777,10 +1031,17 @@ export async function autoAssemble(parts, opts = {}) {
       const m = Math.max(plus, minus); if (m < 6 && !(wb.containsPoint(pa.center) && m > 0)) continue;
       const sgn = drivenBy ? drivenBy.sg : plus >= minus ? 1 : -1, m2 = drivenBy ? drivenBy.a : m;
       hinge = { type: 'hinge', axis: axis.toArray(), origin: pa.center.toArray().map((v) => +v.toFixed(2)), range: [0, sgn * m2], confidence: 0.6,
-        reason: `pin-in-hole: ${q.id} (axis ${AX[pa.a]}) passes through; free swing ${plus}° / −${minus}°${drv}`,
+        reason: `pin-in-hole: ${q.id} (axis ${AX[pa.a]}) passes through; free swing ${plus}° / −${minus}°${drv}${riders.length ? ` (${riders.join(', ')} turn with it)` : ''}${sleeveOn[p.id] ? ' (sleeve on the pin)' : ''}`,
         note: `${pretty(p.id)}: swings ${m2}° about ${q.id} (${AX[pa.a]} axis)` };
       break;
     }
+    // hinge about a lever pivot (hole on hole, see above): swept exact check to first contact, both directions
+    if (!hinge && pivotOn[p.id]) { const pv = pivotOn[p.id], axis = V(); axis.setComponent(pv.a, 1);
+      let plus = swing(p, P, axis, pv.center, 1, skip, 2, 180), minus = swing(p, P, axis, pv.center, -1, skip, 2, 180); [plus, minus] = exactSwing(p, axis, pv.center, skip, plus, minus);
+      const m = Math.max(plus, minus), sgn = plus >= minus ? 1 : -1;
+      if (m >= 2) hinge = { type: 'hinge', axis: axis.toArray(), origin: pv.center.toArray().map((v) => +v.toFixed(2)), range: [0, sgn * m], confidence: 0.5,
+        reason: `lever pivot: ⌀${pv.d.toFixed(1)} hole coaxial with the ⌀${pv.dT.toFixed(1)} hole of ${pv.onto} (pin/filament through both); free swing ${plus}° / −${minus}°`,
+        note: `${pretty(p.id)}: swings ${m}° about its pivot on ${pv.onto} (${AX[pv.a]} axis)` }; }
     J[p.id] = null;
     if (!hinge && push) J[p.id] = { type: 'slider', axis: push.d.d.toArray(), range: [0, push.t], confidence: 0.7,
       reason: `push rod: escapes ${dirName(out0)} (out of the housing), so it is pressed ${dirName(push.d)} into ${base.id}; stops after ${push.t} mm against ${base.id}${push.blocked < push.t ? ` (drives the part it touches after ${push.blocked} mm)` : ''}`,
@@ -917,3 +1178,4 @@ export async function autoAssemble(parts, opts = {}) {
   return { poses, joints, guesses, roles, expected, layout: plate ? 'plate' : 'assembly', orient, mode: inPlace ? 'in-place' : keep.kept.length > 1 ? 'mixed' : 'search', kept: keep.kept.map((p) => p.id), pass1: { frame, rejected: why }, base: base.id, collisions: cp.collisions.map(({ a, b }) => ({ a, b })), timeMs: Date.now() - t0 };
 }
 
+export const __internals = { rayHoles, buildGrid, findHoles, holesOf, rodOf, score, ROTATIONS_24, refineHole, pivotPairs };

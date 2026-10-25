@@ -139,3 +139,10 @@ The orientation is always evaluated, deterministically and identically on the ma
 - Collision-aware refine (`opts.refine: false` turns it off): each searched part (largest first; pins and small fasteners are skipped) is nudged by up to 1.5 mm along the base axes. A nudge is kept only if it reduces the number of parts it intersects and keeps at least 60 % of its contact.
 - `result.expected`: designed contacts in the preset `expected` format (`{a, b, box, reason}`, in the result's world frame): pins press-fitted in holes, and the backplate on the base back. Pass it to `classify(checkPose(...), result.expected)` so these show as amber rather than as errors.
 - Speed and memory: scoring uses an inlined voxel lookup (about 2.5× faster). The voxel grid drops its eroded core array after sampling. BVHs are reused through `geometry.boundsTree`. The worker receives indexed geometry (position + index), not a non-indexed copy.
+
+### Blind-test rules (post a5c05da)
+- Drawer seating: out-direction = housing open face / drawer front (wall-less side); insert to back stop or front-flush.
+- Shell rim mating: stack halves at facing planar rims (open rim on at least one side, footprints within 15%).
+- Lever pivots: `rayHoles()` (exact ray parity, d 1–6 mm) finds round holes on elongated arms; matched to holes of placed parts (|Δd| ≤ 0.4) and hinged there, range by swept collision (±180°). `opts.pivots=false` disables.
+- Exact nudge: BVH-intersecting non-pin parts get moved 0.25–1.5 mm along an axis to clear.
+- Known limits: no peg/boss or open C-hook pivots; held-out zytm StorageBox drawer still mis-rotated; pins without a matching knuckle hole can be taken as drawers.
