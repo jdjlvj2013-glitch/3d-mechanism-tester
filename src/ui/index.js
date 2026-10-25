@@ -275,6 +275,7 @@ export function mount(root) {
     S.joints = [...A.snapshot.filter(j => !(posed.has(j.part) && j.type === 'fixed')), ...live.map(i => i.joint), ...extra];
     for (const p of S.parts) p.fixed = A.fixed[p.id] ?? p.fixed;
     live.filter(i => i.kind === 'joint' && i.joint.type !== 'fixed').forEach(i => { const p = S.parts.find(x => x.id === i.part); if (p) p.fixed = false; });
+    const bp = live.length && S.parts.find(p => p.id === S.lastAuto?.base); if (bp) bp.fixed = true; // tick the part the engine chose as base
     renderAll(); renderAuto();
   }
   function renderAuto() {
